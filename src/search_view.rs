@@ -18,6 +18,7 @@ use gpui_kit::{
     *,
 };
 use std::{
+    collections::BTreeSet,
     path::PathBuf,
     sync::{
         Arc,
@@ -34,6 +35,11 @@ actions!(
         OpenResult,
         RevealResult,
         CopyPath,
+        CopyFiles,
+        TrashResults,
+        SelectAllResults,
+        ExtendNextResult,
+        ExtendPreviousResult,
         QuickLook,
         NextResult,
         PreviousResult,
@@ -52,6 +58,8 @@ enum Sort {
 struct FilterResults {
     results: Arc<Vec<Arc<Entry>>>,
     selected: Option<usize>,
+    selected_paths: Arc<BTreeSet<PathBuf>>,
+    selection_anchor: Option<PathBuf>,
     sort: Sort,
     descending: bool,
 }
@@ -62,10 +70,13 @@ pub(crate) struct SearchView {
     preview: Option<crate::quick_look::Preview>,
     index: Index,
     roots: Vec<PathBuf>,
+    excluded: Vec<PathBuf>,
     database_path: Option<PathBuf>,
     snapshot: Snapshot,
     results: Arc<Vec<Arc<Entry>>>,
     selected: Option<usize>,
+    selected_paths: Arc<BTreeSet<PathBuf>>,
+    selection_anchor: Option<PathBuf>,
     scroll: UniformListScrollHandle,
     case: bool,
     path: bool,
@@ -92,8 +103,9 @@ impl SearchView {
         cx: &mut Context<Self>,
     ) -> Self {
         let roots = cx.global::<Settings>().roots.clone();
+        let excluded = cx.global::<Settings>().excluded.clone();
         let starting = !roots.is_empty();
-        let index = Index::start(roots.clone(), database_path.clone());
+        let index = Index::start(roots.clone(), database_path.clone(), excluded.clone());
         let snapshot = index.snapshot();
         let input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search files and folders…"));
@@ -112,10 +124,12 @@ impl SearchView {
                 if this
                     .update_in(cx, |this, window, cx| {
                         let roots = cx.global::<Settings>().roots.clone();
-                        if roots != this.roots {
+                        let excluded = cx.global::<Settings>().excluded.clone();
+                        if roots != this.roots || excluded != this.excluded {
                             this.roots = roots.clone();
+                            this.excluded = excluded.clone();
                             this.index.stop();
-                            this.index = Index::start(roots, this.database_path.clone());
+                            this.index = Index::start(roots, this.database_path.clone(), excluded);
                             this.snapshot = this.index.snapshot();
                             this.search(window, cx, true);
                         }
@@ -135,10 +149,13 @@ impl SearchView {
             preview: None,
             index,
             roots,
+            excluded,
             database_path,
             snapshot,
             results: Arc::new(Vec::new()),
             selected: None,
+            selected_paths: Arc::new(BTreeSet::new()),
+            selection_anchor: None,
             scroll: UniformListScrollHandle::new(),
             case: false,
             path: false,
@@ -206,6 +223,8 @@ impl SearchView {
                 self.error = Some(error);
                 self.results = Arc::new(Vec::new());
                 self.selected = None;
+                self.selected_paths = Arc::new(BTreeSet::new());
+                self.selection_anchor = None;
                 self.searching = false;
                 cx.notify();
                 return;
@@ -324,6 +343,8 @@ impl SearchView {
                     this.filter_results[filter] = Some(FilterResults {
                         results: this.results.clone(),
                         selected: this.selected,
+                        selected_paths: this.selected_paths.clone(),
+                        selection_anchor: this.selection_anchor.clone(),
                         sort,
                         descending,
                     });
@@ -344,6 +365,8 @@ impl SearchView {
             && let Some(saved) = &mut self.filter_results[self.filter]
         {
             saved.selected = self.selected;
+            saved.selected_paths = self.selected_paths.clone();
+            saved.selection_anchor = self.selection_anchor.clone();
         }
         self.filter = filter;
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
@@ -356,6 +379,8 @@ impl SearchView {
             self.error = None;
             self.results = saved.results.clone();
             self.selected = saved.selected;
+            self.selected_paths = saved.selected_paths.clone();
+            self.selection_anchor = saved.selection_anchor.clone();
             self.sort = saved.sort;
             self.descending = saved.descending;
             cx.notify();
@@ -372,11 +397,36 @@ impl SearchView {
         cx: &mut Context<Self>,
         reveal_selection: bool,
     ) {
-        self.selected = self
+        let active = self
             .selected
             .and_then(|i| self.results.get(i))
-            .and_then(|entry| results.iter().position(|result| result.path == entry.path))
+            .map(|entry| &entry.path);
+        let mut paths: BTreeSet<_> = results
+            .iter()
+            .filter(|entry| self.selected_paths.contains(&entry.path))
+            .map(|entry| entry.path.clone())
+            .collect();
+        self.selected = active
+            .and_then(|path| {
+                results
+                    .iter()
+                    .position(|entry| &entry.path == path && paths.contains(path))
+            })
+            .or_else(|| results.iter().position(|entry| paths.contains(&entry.path)))
             .or_else(|| (!results.is_empty()).then_some(0));
+        if paths.is_empty()
+            && let Some(i) = self.selected
+        {
+            paths.insert(results[i].path.clone());
+        }
+        if self
+            .selection_anchor
+            .as_ref()
+            .is_none_or(|path| !paths.contains(path))
+        {
+            self.selection_anchor = self.selected.map(|i| results[i].path.clone());
+        }
+        self.selected_paths = Arc::new(paths);
         self.results = results;
         if reveal_selection {
             self.scroll
@@ -390,14 +440,15 @@ impl SearchView {
             self.pending_open = Some(reveal);
             return;
         }
-        let Some(entry) = self.selected.and_then(|i| self.results.get(i)) else {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
             return;
-        };
+        }
         let mut command = std::process::Command::new("/usr/bin/open");
         if reveal {
             command.arg("-R");
         }
-        command.arg(&entry.path);
+        command.args(paths);
         self.run_command(command, "open result", window, cx);
     }
 
@@ -431,19 +482,41 @@ impl SearchView {
         .detach();
     }
 
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        self.results
+            .iter()
+            .filter(|entry| self.selected_paths.contains(&entry.path))
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
     fn copy(&self, cx: &mut Context<Self>) {
-        if let Some(entry) = self.selected.and_then(|i| self.results.get(i)) {
+        let paths = self.selected_paths();
+        if !paths.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
-                entry.path.to_string_lossy().into_owned(),
+                paths
+                    .iter()
+                    .map(|path| path.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
             ));
         }
     }
 
-    fn trash(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    fn copy_files(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = crate::file_actions::copy_files(
+            &self.selected_paths(),
+            &objc2_app_kit::NSPasteboard::generalPasteboard(),
+        ) {
+            self.error = Some(format!("Couldn’t copy files: {error}"));
+            cx.notify();
+        }
+    }
+
+    fn trash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = self.selected_paths();
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { move_to_trash(&path) })
-                .await;
+            let result = cx.background_spawn(async move { trash_paths(paths) }).await;
             let _ = this.update(cx, |this, cx| {
                 if let Err(error) = result {
                     this.error = Some(format!("Couldn’t move to Trash: {error}"));
@@ -454,8 +527,73 @@ impl SearchView {
         .detach();
     }
 
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.selected_paths = Arc::new(
+            self.results
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect(),
+        );
+        self.selected = self
+            .selected
+            .or_else(|| (!self.results.is_empty()).then_some(0));
+        self.selection_anchor = self.selected.map(|i| self.results[i].path.clone());
+        cx.notify();
+    }
+
     fn select_result(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected = Some(index);
+        self.select_with_modifiers(index, Modifiers::default(), false, window, cx);
+    }
+
+    fn select_with_modifiers(
+        &mut self,
+        index: usize,
+        modifiers: Modifiers,
+        context_menu: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self.results.get(index) else {
+            return;
+        };
+        let path = entry.path.clone();
+        if context_menu && self.selected_paths.contains(&path) {
+            self.selected = Some(index);
+        } else if modifiers.shift && !context_menu {
+            let anchor = self
+                .selection_anchor
+                .as_ref()
+                .and_then(|path| self.results.iter().position(|entry| &entry.path == path))
+                .unwrap_or(index);
+            let paths = Arc::make_mut(&mut self.selected_paths);
+            if !modifiers.platform {
+                paths.clear();
+            }
+            paths.extend(
+                self.results[anchor.min(index)..=anchor.max(index)]
+                    .iter()
+                    .map(|entry| entry.path.clone()),
+            );
+            self.selection_anchor = Some(self.results[anchor].path.clone());
+            self.selected = Some(index);
+        } else if modifiers.platform && !context_menu {
+            let paths = Arc::make_mut(&mut self.selected_paths);
+            if !paths.remove(&path) {
+                paths.insert(path.clone());
+            }
+            self.selected = if paths.contains(&path) {
+                Some(index)
+            } else {
+                self.results
+                    .iter()
+                    .position(|entry| paths.contains(&entry.path))
+            };
+            self.selection_anchor = self.selected.map(|i| self.results[i].path.clone());
+        } else {
+            self.selected_paths = Arc::new(BTreeSet::from([path.clone()]));
+            self.selection_anchor = Some(path);
+            self.selected = Some(index);
+        }
         self.results_focus.focus(window, cx);
         if let Some(preview) = &self.preview
             && let Some(entry) = self.results.get(index)
@@ -482,18 +620,35 @@ impl SearchView {
         }
     }
 
-    fn move_selection(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
+    fn move_selection(
+        &mut self,
+        direction: isize,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.results.is_empty() {
             return;
         }
-        self.select_result(
-            self.selected
-                .unwrap_or(0)
-                .saturating_add_signed(direction)
-                .min(self.results.len() - 1),
-            window,
-            cx,
-        );
+        let index = self
+            .selected
+            .unwrap_or(0)
+            .saturating_add_signed(direction)
+            .min(self.results.len() - 1);
+        if extend {
+            self.select_with_modifiers(
+                index,
+                Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+                false,
+                window,
+                cx,
+            );
+        } else {
+            self.select_result(index, window, cx);
+        }
         self.scroll
             .scroll_to_item(self.selected.unwrap(), ScrollStrategy::Top);
     }
@@ -631,7 +786,7 @@ impl Render for SearchView {
                 .into_any_element()
         });
         let results = self.results.clone();
-        let selected = self.selected;
+        let selected_paths = self.selected_paths.clone();
         let owner = cx.entity().downgrade();
         let action_context = self.results_focus.clone();
         let no_results = self.results.is_empty();
@@ -675,10 +830,10 @@ impl Render for SearchView {
             .on_action(cx.listener(|this, _: &OpenResult, window, cx| this.open(false, window, cx)))
             .on_action(cx.listener(|this, _: &RevealResult, window, cx| this.open(true, window, cx)))
             .on_action(cx.listener(|this, _: &CopyPath, _, cx| this.copy(cx)))
-            .on_action(cx.listener(|this, _: &NextResult, window, cx| this.move_selection(1, window, cx)))
-            .on_action(cx.listener(|this, _: &PreviousResult, window, cx| this.move_selection(-1, window, cx)))
+            .on_action(cx.listener(|this, _: &NextResult, window, cx| this.move_selection(1, false, window, cx)))
+            .on_action(cx.listener(|this, _: &PreviousResult, window, cx| this.move_selection(-1, false, window, cx)))
             .on_action(cx.listener(|_, _: &SearchHelp, window, cx| crate::settings_view::show_error(
-                "Search filenames as you type.\n\nreport budget — both words\n\"annual report\" — exact phrase\n*.pdf | *.docx — either pattern\n!backup — exclude a word\n<cat | dog> photo — group terms\next:jpg;png — extension filter\nfile: / folder: — kind\npath:Projects — search full path\nsize:>10mb — size filter\n\nAa: case sensitive. Path: match full paths. Regex: treat the entire query as a regular expression.\n\n⌘F Search · ↓/↑ Select · Space Quick Look · Return Open · ⌘Return Reveal · ⇧⌘C Copy path · ⌘R Rebuild · ⌘, Folders".into(), window, cx)))
+                "Search filenames as you type.\n\nreport budget — both words\n\"annual report\" — exact phrase\n*.pdf | *.docx — either pattern\n!backup — exclude a word\n<cat | dog> photo — group terms\next:jpg;png — extension filter\nfile: / folder: — kind\npath:Projects — search full path\nsize:>10mb — size filter\n\nAa: case sensitive. Path: match full paths. Regex: treat the entire query as a regular expression.\n\n⌘-click Toggle selection · Shift-click Select range · ⌘A Select all · ⇧↑/↓ Extend selection · ⌘C Copy files · ⌘⌫ Move to Trash\n\n⌘F Search · ↓/↑ Select · Space Quick Look · Return Open · ⌘Return Reveal · ⇧⌘C Copy path · ⌘R Rebuild · ⌘, Folders".into(), window, cx)))
             .child(div().flex().items_center().gap_2().px_5().pt_4().pb_3()
                 .child(div().flex_1().min_w_0().child(Input::new(&self.input).id("search-input").aria_label("Search files and folders")
                 .prefix(Icon::new(IconName::Search).small().text_color(cx.theme().muted_foreground))
@@ -708,6 +863,11 @@ impl Render for SearchView {
                 .child(div().w(px(90.)).text_sm().py_2().child("Type"))
                 .child(self.heading("Modified", Sort::Modified, 110., cx)))
             .child(div().id("results-table").test_support().track_focus(&self.results_focus).key_context("FileResults")
+                .on_action(cx.listener(|this, _: &SelectAllResults, _, cx| this.select_all(cx)))
+                .on_action(cx.listener(|this, _: &CopyFiles, _, cx| this.copy_files(cx)))
+                .on_action(cx.listener(|this, _: &TrashResults, window, cx| this.trash(window, cx)))
+                .on_action(cx.listener(|this, _: &ExtendNextResult, window, cx| this.move_selection(1, true, window, cx)))
+                .on_action(cx.listener(|this, _: &ExtendPreviousResult, window, cx| this.move_selection(-1, true, window, cx)))
                 .on_action(cx.listener(|this, _: &QuickLook, window, cx| this.quick_look(window, cx)))
                 .role(Role::Table).aria_label(format!("{} results", self.results.len())).aria_row_count(self.results.len()).relative().flex_1().min_h_0().bg(cx.theme().table).child(
                 uniform_list("results", results.len(), move |range, _, cx| {
@@ -722,10 +882,10 @@ impl Render for SearchView {
                         let action_context = action_context.clone();
                         let menu_path = entry.path.clone();
                         div().id(("result", i)).test_support().role(Role::Row).aria_label(entry.path.to_string_lossy().into_owned())
-                            .aria_selected(selected == Some(i)).flex().items_center().h(px(36.)).px_5().text_sm().w_full().cursor_pointer()
+                            .aria_selected(selected_paths.contains(&entry.path)).flex().items_center().h(px(36.)).px_5().text_sm().w_full().cursor_pointer()
                             .when(i % 2 == 1, |row| row.bg(cx.theme().table_even))
-                            .hover(|row| row.bg(if selected == Some(i) { cx.theme().selection } else { cx.theme().table_hover }))
-                            .when(selected == Some(i), |row| row.bg(cx.theme().selection))
+                            .hover(|row| row.bg(if selected_paths.contains(&entry.path) { cx.theme().selection } else { cx.theme().table_hover }))
+                            .when(selected_paths.contains(&entry.path), |row| row.bg(cx.theme().selection))
                             .child(div().w(px(280.)).flex_shrink_0().pr_3().flex().items_center().gap_2()
                                 .child(Icon::new(if entry.is_dir { IconName::Folder } else { IconName::File }).small().flex_shrink_0()
                                     .text_color(if entry.is_dir { cx.theme().link } else { cx.theme().muted_foreground }))
@@ -734,12 +894,12 @@ impl Render for SearchView {
                             .child(div().w(px(90.)).flex_shrink_0().child(if entry.is_dir { "—".into() } else { format_size(entry.allocated_size) }))
                             .child(div().w(px(90.)).flex_shrink_0().truncate().child(kind))
                             .child(div().w(px(110.)).flex_shrink_0().child(format_modified(entry.modified)))
-                            .capture_any_mouse_down(move |_, window, cx| {
-                                let _ = mouse_owner.update(cx, |this, cx| this.select_result(i, window, cx));
+                            .capture_any_mouse_down(move |event, window, cx| {
+                                let _ = mouse_owner.update(cx, |this, cx| this.select_with_modifiers(i, event.modifiers, event.button == MouseButton::Right || event.modifiers.control, window, cx));
                             })
                             .on_click(move |event, window, cx| {
                                 let _ = click_owner.update(cx, |this, cx| {
-                                    this.select_result(i, window, cx);
+                                    if !matches!(event, ClickEvent::Mouse(_)) { this.select_result(i, window, cx); }
                                     if event.click_count() == 2 { this.open(false, window, cx); }
                                 });
                             })
@@ -753,42 +913,29 @@ impl Render for SearchView {
                                         }
                                     });
                                 }).detach();
-                                let trash_owner = owner.clone();
-                                let trash_path = menu_path.clone();
+                                let multiple = owner.upgrade().is_some_and(|owner| owner.read(cx).selected_paths.len() > 1);
                                 let info_owner = owner.clone();
                                 let info_path = menu_path.clone();
-                                let copy_owner = owner.clone();
-                                let copy_path = menu_path.clone();
+
                                 let rename_path = menu_path.clone();
                                 menu.action_context(action_context.clone())
                                     .menu_with_icon("Open", IconName::ExternalLink, Box::new(OpenResult))
                                     .menu_with_icon("Show in Finder", IconName::FolderOpen, Box::new(RevealResult))
-                                    .item(PopupMenuItem::new("Get Info").icon(IconName::Info)
+                                    .item(PopupMenuItem::new("Get Info").icon(IconName::Info).disabled(multiple)
                                         .on_click(move |_, window, cx| {
                                             let _ = info_owner.update(cx, |this, cx| this.run_command(
                                                 crate::file_actions::get_info_command(&info_path), "get file info", window, cx));
                                         }))
                                     .separator()
-                                    .item(PopupMenuItem::new("Copy").icon(IconName::Copy)
-                                        .on_click(move |_, _, cx| {
-                                            if let Err(error) = crate::file_actions::copy_file(&copy_path, &objc2_app_kit::NSPasteboard::generalPasteboard()) {
-                                                let _ = copy_owner.update(cx, |this, cx| {
-                                                    this.error = Some(format!("Couldn’t copy file: {error}"));
-                                                    cx.notify();
-                                                });
-                                            }
-                                        }))
-                                    .menu_with_icon("Copy path", IconName::Copy, Box::new(CopyPath))
-                                    .item(PopupMenuItem::new("Rename…").icon(IconName::Pencil)
+                                    .menu_with_icon("Copy", IconName::Copy, Box::new(CopyFiles))
+                                    .menu_with_icon(if multiple { "Copy paths" } else { "Copy path" }, IconName::Copy, Box::new(CopyPath))
+                                    .item(PopupMenuItem::new("Rename…").icon(IconName::Pencil).disabled(multiple)
                                         .on_click(move |_, window, cx| {
                                             let path = rename_path.clone();
                                             window.defer(cx, move |window, cx| crate::file_actions::show_rename(path, window, cx));
                                         }))
                                     .separator()
-                                    .item(PopupMenuItem::new("Move to Trash").icon(IconName::Trash)
-                                        .on_click(move |_, window, cx| {
-                                            let _ = trash_owner.update(cx, |this, cx| this.trash(trash_path.clone(), window, cx));
-                                        }))
+                                    .menu_with_icon("Move to Trash", IconName::Trash, Box::new(TrashResults))
                             }).into_any_element()
                     }).collect()
                 }).size_full().track_scroll(&self.scroll)
@@ -816,11 +963,11 @@ impl Render for SearchView {
                         })))))))
             .child(div().flex().items_center().gap_2().px_5().py_3().border_t_1().border_color(cx.theme().border).bg(cx.theme().status_bar)
                 .child(div().flex().flex_1().items_center().gap_2()
-                .child(Button::new("open").primary().small().icon(IconName::ExternalLink).label("Open").tooltip("Open selected result · Return").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.open(false, window, cx))))
-                .child(Button::new("reveal").ghost().small().icon(IconName::FolderOpen).label("Show in Finder").tooltip("Reveal selected result · ⌘Return").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.open(true, window, cx))))
-                .child(Button::new("copy-path").ghost().small().icon(IconName::Copy).label("Copy path").tooltip("Copy full path · ⇧⌘C").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, _, cx| this.copy(cx)))))
-                .child(div().id("result-count").test_support().role(Role::Status).aria_label(format!("{} matches", self.results.len()))
-                    .flex_shrink_0().text_xs().text_color(cx.theme().muted_foreground).child(format!("{} matches", format_count(self.results.len()))))
+                .child(Button::new("open").primary().small().icon(IconName::ExternalLink).label("Open").tooltip("Open selected results · Return").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.open(false, window, cx))))
+                .child(Button::new("reveal").ghost().small().icon(IconName::FolderOpen).label("Show in Finder").tooltip("Reveal selected results · ⌘Return").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.open(true, window, cx))))
+                .child(Button::new("copy-path").ghost().small().icon(IconName::Copy).label(if self.selected_paths.len() > 1 { "Copy paths" } else { "Copy path" }).tooltip("Copy selected paths · ⇧⌘C").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, _, cx| this.copy(cx)))))
+                .child(div().id("result-count").test_support().role(Role::Status).aria_label(if self.selected_paths.len() > 1 { format!("{} matches, {} selected", self.results.len(), self.selected_paths.len()) } else { format!("{} matches", self.results.len()) })
+                    .flex_shrink_0().text_xs().text_color(cx.theme().muted_foreground).child(if self.selected_paths.len() > 1 { format!("{} matches · {} selected", format_count(self.results.len()), format_count(self.selected_paths.len())) } else { format!("{} matches", format_count(self.results.len())) }))
                 .child(div().flex().flex_1().items_center().justify_end().gap_2()
                 .child(Button::new("full-disk-access").ghost().small().icon(IconName::TriangleAlert).accessibility_label("Needs Full Disk Access")
                     .tooltip(self.snapshot.scan_warning.clone().unwrap_or_else(|| "Open Full Disk Access in System Settings".into()))
@@ -893,6 +1040,32 @@ fn format_size(bytes: u64) -> String {
     format!("{value:.1} {unit}")
 }
 
+fn trash_paths(mut paths: Vec<PathBuf>) -> Result<(), String> {
+    paths.sort();
+    paths.dedup();
+    let mut moved_folders: Vec<PathBuf> = Vec::new();
+    let mut failures = Vec::new();
+    for path in paths {
+        if moved_folders.iter().any(|parent| path.starts_with(parent)) {
+            continue;
+        }
+        let is_dir = std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir());
+        match move_to_trash(&path) {
+            Ok(_) => {
+                if is_dir {
+                    moved_folders.push(path);
+                }
+            }
+            Err(error) => failures.push(format!("{}: {error}", path.display())),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n"))
+    }
+}
+
 fn move_to_trash(path: &std::path::Path) -> Result<Option<PathBuf>, String> {
     use objc2_foundation::{NSFileManager, NSURL};
 
@@ -936,6 +1109,7 @@ mod tests {
             cx.set_reduce_motion(true);
             cx.set_global(Settings {
                 roots: vec![PathBuf::from("/fixture")],
+                excluded: Vec::new(),
             });
         });
         let window = cx.open_window(
@@ -1060,7 +1234,10 @@ mod tests {
         cx.update(gpui_kit::init);
         cx.update(|cx| {
             cx.set_reduce_motion(true);
-            cx.set_global(Settings { roots: Vec::new() });
+            cx.set_global(Settings {
+                roots: Vec::new(),
+                excluded: Vec::new(),
+            });
         });
         let window = cx.open_window(
             gpui_kit::size(gpui_kit::px(1050.), gpui_kit::px(450.)),
@@ -1141,7 +1318,10 @@ mod tests {
         cx.update(gpui_kit::init);
         cx.update(|cx| {
             cx.set_reduce_motion(true);
-            cx.set_global(Settings { roots: Vec::new() });
+            cx.set_global(Settings {
+                roots: Vec::new(),
+                excluded: Vec::new(),
+            });
         });
         let window = cx.open_window(
             gpui_kit::size(gpui_kit::px(1050.), gpui_kit::px(450.)),
@@ -1217,7 +1397,7 @@ mod tests {
         ));
         fs::create_dir(&directory).unwrap();
         let file = directory.join("a 'quoted' 雪; file.txt");
-        let folder = directory.join("folder");
+        let folder = directory.join(directory.file_name().unwrap());
         let link = directory.join("link");
         fs::write(&file, b"keep this content").unwrap();
         fs::create_dir(&folder).unwrap();
@@ -1240,6 +1420,21 @@ mod tests {
             fs::read(folder.join("nested.txt")).unwrap(),
             b"nested content"
         );
+        let destination = move_to_trash(&folder).unwrap().unwrap();
+        fs::rename(&destination, &folder).unwrap();
+        super::trash_paths(vec![folder.join("nested.txt"), folder.clone()]).unwrap();
+        assert!(!folder.exists());
+        fs::rename(destination, &folder).unwrap();
+        assert_eq!(
+            fs::read(folder.join("nested.txt")).unwrap(),
+            b"nested content"
+        );
+        let failure = super::trash_paths(vec![
+            directory.join("missing-one"),
+            directory.join("missing-two"),
+        ])
+        .unwrap_err();
+        assert!(failure.contains("missing-one") && failure.contains("missing-two"));
         assert!(move_to_trash(&directory.join("missing")).is_err());
         assert!(move_to_trash(&directory.join("invalid\0path")).is_err());
         fs::remove_dir_all(directory).unwrap();
@@ -1250,7 +1445,10 @@ mod tests {
         cx.update(gpui_kit::init);
         let (handle, view) = cx.update(|cx| {
             cx.set_reduce_motion(true);
-            cx.set_global(Settings { roots: Vec::new() });
+            cx.set_global(Settings {
+                roots: Vec::new(),
+                excluded: Vec::new(),
+            });
             let (handle, view) =
                 gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
                     window.set_scroll_layers(false);
@@ -1302,7 +1500,12 @@ mod tests {
     #[gpui_kit::test]
     fn access_icon_stays_left_of_navigation_and_opens_full_disk_access(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
-        cx.update(|cx| cx.set_global(Settings { roots: Vec::new() }));
+        cx.update(|cx| {
+            cx.set_global(Settings {
+                roots: Vec::new(),
+                excluded: Vec::new(),
+            })
+        });
         let (window, view) = cx.update(|cx| {
             cx.set_reduce_motion(true);
             gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
@@ -1360,7 +1563,10 @@ mod tests {
         cx.update(gpui_kit::init);
         cx.update(|cx| {
             cx.set_reduce_motion(true);
-            cx.set_global(Settings { roots: Vec::new() });
+            cx.set_global(Settings {
+                roots: Vec::new(),
+                excluded: Vec::new(),
+            });
         });
         let window = cx.open_window(
             gpui_kit::size(gpui_kit::px(1150.), gpui_kit::px(800.)),
@@ -1547,7 +1753,10 @@ mod tests {
         cx.update(gpui_kit::init);
         cx.update(|cx| {
             cx.set_reduce_motion(true);
-            cx.set_global(Settings { roots: Vec::new() });
+            cx.set_global(Settings {
+                roots: Vec::new(),
+                excluded: Vec::new(),
+            });
         });
         let window = cx.open_window(
             gpui_kit::size(gpui_kit::px(1150.), gpui_kit::px(800.)),
@@ -1676,7 +1885,10 @@ mod tests {
         cx.update(gpui_kit::init);
         cx.update(|cx| {
             cx.set_reduce_motion(true);
-            cx.set_global(Settings { roots: Vec::new() });
+            cx.set_global(Settings {
+                roots: Vec::new(),
+                excluded: Vec::new(),
+            });
         });
         let window = cx.add_window(|window, cx| {
             // The native entry point sets GPUI_SCROLL_LAYERS=0 before starting GPUI.

@@ -25,15 +25,30 @@ pub(crate) fn get_info_command(path: &Path) -> Command {
     command
 }
 
-pub(crate) fn copy_file(path: &Path, pasteboard: &NSPasteboard) -> Result<(), String> {
-    std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    let url = NSURL::from_file_path(path).ok_or("Invalid file path")?;
-    let objects = NSArray::from_slice(&[ProtocolObject::from_ref(&*url)]);
+pub(crate) fn copy_files(paths: &[PathBuf], pasteboard: &NSPasteboard) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let urls = paths
+        .iter()
+        .map(|path| {
+            std::fs::symlink_metadata(path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            NSURL::from_file_path(path)
+                .ok_or_else(|| format!("Invalid file path: {}", path.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let objects = NSArray::from_slice(
+        &urls
+            .iter()
+            .map(|url| ProtocolObject::from_ref(&**url))
+            .collect::<Vec<_>>(),
+    );
     pasteboard.clearContents();
     if pasteboard.writeObjects(&objects) {
         Ok(())
     } else {
-        Err("The clipboard couldn’t accept this file.".into())
+        Err("The clipboard couldn’t accept these files.".into())
     }
 }
 
@@ -156,9 +171,10 @@ impl Render for RenameForm {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_file, get_info_command, rename_file};
+    use super::{copy_files, get_info_command, rename_file};
+    use objc2::ClassType;
     use objc2_app_kit::{NSPasteboard, NSURLNSPasteboardSupport};
-    use objc2_foundation::NSURL;
+    use objc2_foundation::{NSArray, NSURL};
     use std::{
         fs, io,
         os::unix::fs::symlink,
@@ -183,14 +199,26 @@ mod tests {
         fs::write(&file, b"source").unwrap();
         fs::write(&existing, b"destination").unwrap();
         let pasteboard = NSPasteboard::pasteboardWithUniqueName();
-        copy_file(&file, &pasteboard).unwrap();
+        copy_files(std::slice::from_ref(&file), &pasteboard).unwrap();
         assert_eq!(
             NSURL::URLFromPasteboard(&pasteboard)
                 .unwrap()
                 .to_file_path(),
             Some(file.clone())
         );
-        assert!(copy_file(&directory.join("missing"), &pasteboard).is_err());
+        copy_files(&[file.clone(), existing.clone()], &pasteboard).unwrap();
+        let classes = NSArray::from_slice(&[NSURL::class()]);
+        // NSURL conforms to NSPasteboardReading; no reading options are needed.
+        let copied = unsafe { pasteboard.readObjectsForClasses_options(&classes, None) }.unwrap();
+        assert_eq!(copied.len(), 2);
+        assert!(copy_files(&[file.clone(), directory.join("missing")], &pasteboard).is_err());
+        assert_eq!(
+            unsafe { pasteboard.readObjectsForClasses_options(&classes, None) }
+                .unwrap()
+                .len(),
+            2,
+            "Failed validation must preserve the clipboard"
+        );
         pasteboard.clearContents();
         assert_eq!(
             rename_file(&file, "existing.txt").unwrap_err().kind(),

@@ -11,12 +11,14 @@ const MAX_SETTINGS_BYTES: usize = 1024 * 1024;
 #[serde(default)]
 pub(crate) struct Settings {
     pub(crate) roots: Vec<PathBuf>,
+    pub(crate) excluded: Vec<PathBuf>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             roots: dirs::home_dir().into_iter().collect(),
+            excluded: Vec::new(),
         }
     }
 }
@@ -44,7 +46,11 @@ impl Settings {
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360"><rect width="640" height="360" fill="#dbeafe"/><path d="M0 360 220 100 420 360M280 360 470 160 640 360" fill="#60a5fa"/></svg>"##,
         )?;
         let path = directory.join("data/settings.json");
-        Self { roots: vec![root] }.save(&path)?;
+        Self {
+            roots: vec![root],
+            excluded: Vec::new(),
+        }
+        .save(&path)?;
         Ok(path)
     }
 
@@ -74,10 +80,18 @@ impl Settings {
     }
 
     fn validate(&self) -> io::Result<()> {
-        if self.roots.len() > 64 || self.roots.iter().any(|path| !path.is_absolute()) {
+        if self.roots.len() > 64
+            || self.excluded.len() > 64
+            || self.roots.iter().chain(&self.excluded).any(|path| {
+                !path.is_absolute()
+                    || path
+                        .components()
+                        .any(|part| matches!(part, std::path::Component::ParentDir))
+            })
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Use at most 64 absolute folder paths",
+                "Use at most 64 absolute paths per folder list, without .. components",
             ));
         }
         Ok(())
@@ -159,6 +173,7 @@ mod tests {
             let index = crate::index::Index::start(
                 settings.roots.clone(),
                 Some(path.with_file_name("index.sqlite3")),
+                settings.excluded.clone(),
             );
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             loop {
@@ -205,7 +220,10 @@ mod tests {
             let missing = directory.join("missing.json");
             assert!(Settings::read(&missing).is_err());
             assert!(!missing.exists());
+            let legacy: Settings = serde_json::from_str(r#"{"roots":[]}"#)?;
+            assert!(legacy.excluded.is_empty());
             settings.roots = vec![directory.clone()];
+            settings.excluded = vec![directory.join("build")];
             settings.save(&path)?;
             assert_eq!(Settings::load(&path)?, settings);
             fs::write(&path, "{}")?;
@@ -219,6 +237,17 @@ mod tests {
                 assert!(Settings::load(&path).is_err());
                 assert_eq!(fs::read_to_string(&path)?, invalid);
             }
+            for excluded in [
+                vec![PathBuf::from("relative")],
+                vec![directory.join("../outside")],
+                vec![directory.clone(); 65],
+            ] {
+                let invalid = Settings {
+                    roots: vec![directory.clone()],
+                    excluded,
+                };
+                assert!(invalid.save(&path).is_err());
+            }
             let oversized = directory.join("oversized.json");
             fs::write(&oversized, vec![b' '; MAX_SETTINGS_BYTES + 1])?;
             assert_eq!(
@@ -227,6 +256,7 @@ mod tests {
             );
             let huge = Settings {
                 roots: vec![PathBuf::from("x".repeat(MAX_SETTINGS_BYTES))],
+                excluded: Vec::new(),
             };
             assert!(huge.save(&path).is_err());
             assert_eq!(fs::read_to_string(&path)?, r#"{"roots":-1}"#);

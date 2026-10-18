@@ -35,6 +35,7 @@ impl Fixture {
         let settings = directory.join("settings.json");
         Settings {
             roots: vec![root.clone()],
+            excluded: Vec::new(),
         }
         .save(&settings)
         .unwrap();
@@ -52,12 +53,31 @@ impl Fixture {
             cx.set_reduce_motion(true);
             cx.set_global(Settings {
                 roots: vec![self.root.clone()],
+                excluded: Vec::new(),
             });
             cx.bind_keys([
                 KeyBinding::new("down", search_view::NextResult, Some("Everything")),
                 KeyBinding::new("up", search_view::PreviousResult, Some("Everything")),
                 KeyBinding::new("cmd-f", search_view::FocusSearch, Some("Everything")),
                 KeyBinding::new("space", search_view::QuickLook, Some("FileResults")),
+                KeyBinding::new("cmd-a", search_view::SelectAllResults, Some("FileResults")),
+                KeyBinding::new("cmd-c", search_view::CopyFiles, Some("FileResults")),
+                KeyBinding::new("shift-cmd-c", search_view::CopyPath, Some("Everything")),
+                KeyBinding::new(
+                    "cmd-backspace",
+                    search_view::TrashResults,
+                    Some("FileResults"),
+                ),
+                KeyBinding::new(
+                    "shift-down",
+                    search_view::ExtendNextResult,
+                    Some("FileResults"),
+                ),
+                KeyBinding::new(
+                    "shift-up",
+                    search_view::ExtendPreviousResult,
+                    Some("FileResults"),
+                ),
                 KeyBinding::new("cmd-,", OpenSettings, None),
             ]);
             let (handle, view) = gpui_kit::open_window(
@@ -558,4 +578,202 @@ async fn empty_search_can_reset_all_filters(cx: &mut TestAppContext) {
     })
     .unwrap();
     wait_count(cx, handle, 0).await;
+}
+
+#[gpui_kit::test]
+async fn multiple_selection_uses_modifiers_keyboard_and_preserves_context_selection(
+    cx: &mut TestAppContext,
+) {
+    let fixture = Fixture::new();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click(("result", 1usize), cx);
+        window.click_with_modifiers(
+            ("result", 3usize),
+            gpui_kit::Modifiers {
+                platform: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        assert_eq!(window.find(("result", 1usize)).selected(), Some(true));
+        assert_eq!(window.find(("result", 3usize)).selected(), Some(true));
+        window.click("copy-path", cx);
+        assert_eq!(
+            cx.read_from_clipboard().unwrap().text().unwrap(),
+            format!(
+                "{}\n{}",
+                fixture.root.join("Archive").display(),
+                fixture.root.join("alpha.txt").display()
+            )
+        );
+        window.right_click(("result", 1usize), cx);
+    })
+    .unwrap();
+    cx.wait_for(handle, Duration::from_secs(3), |window, _| {
+        window.try_find("popup-menu").is_some()
+    })
+    .await;
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(window.find(("result", 3usize)).selected(), Some(true));
+        assert_eq!(
+            window.within("popup-menu").find(5usize).label(),
+            Some("Copy paths")
+        );
+        window.within("popup-menu").click(6usize, cx);
+        assert!(
+            window.try_find("dialog").is_none(),
+            "Multiple selection cannot rename one arbitrary result"
+        );
+        window.press("escape", cx);
+    })
+    .unwrap();
+    cx.wait_for(handle, Duration::from_secs(3), |window, _| {
+        window.try_find("popup-menu").is_none()
+    })
+    .await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click(("result", 1usize), cx);
+        window.click_with_modifiers(
+            ("result", 4usize),
+            gpui_kit::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        for i in 1usize..=4 {
+            assert_eq!(window.find(("result", i)).selected(), Some(true));
+        }
+        window.click_with_modifiers(
+            ("result", 2usize),
+            gpui_kit::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        assert_eq!(window.find(("result", 3usize)).selected(), Some(false));
+        window.press("shift-down", cx);
+        assert_eq!(window.find(("result", 3usize)).selected(), Some(true));
+        window.press("shift-up", cx);
+        assert_eq!(window.find(("result", 3usize)).selected(), Some(false));
+        window.press("cmd-a", cx);
+        for i in 0usize..6 {
+            assert_eq!(window.find(("result", i)).selected(), Some(true));
+        }
+        window.press("shift-cmd-c", cx);
+        assert_eq!(
+            cx.read_from_clipboard()
+                .unwrap()
+                .text()
+                .unwrap()
+                .lines()
+                .count(),
+            6
+        );
+        window.click(("result", 3usize), cx);
+        window.click_with_modifiers(
+            ("result", 4usize),
+            gpui_kit::Modifiers {
+                platform: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        window.press("cmd-c", cx);
+        window.click_with_modifiers(
+            ("result", 3usize),
+            gpui_kit::Modifiers {
+                platform: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        assert_eq!(window.find(("result", 3usize)).selected(), Some(false));
+        window.click_with_modifiers(
+            ("result", 4usize),
+            gpui_kit::Modifiers {
+                platform: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        for i in 0usize..6 {
+            assert_eq!(window.find(("result", i)).selected(), Some(false));
+        }
+        window.click("search-input", cx);
+        window.input("alpha", cx);
+        window.press("cmd-a", cx);
+        window.input("beta", cx);
+        assert_eq!(window.find("search-input").value(), Some("beta"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+async fn excluded_folders_can_be_cancelled_saved_and_removed(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    let excluded = fixture.root.join("Archive");
+    for save in [false, true] {
+        cx.update_window(handle, |_, window, cx| window.press("cmd-,", cx))
+            .unwrap();
+        wait_dialog(cx, handle, true).await;
+        cx.update_window(handle, |_, window, cx| {
+            window.within("dialog").click("exclude-folder", cx)
+        })
+        .unwrap();
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|options| {
+            assert!(options.directories && !options.files && options.multiple);
+            Some(vec![excluded.clone(), excluded.clone()])
+        });
+        let remove_id = format!("remove-excluded-{}", excluded.display());
+        cx.wait_for(handle, Duration::from_secs(3), |window, _| {
+            window
+                .within("dialog")
+                .try_find(remove_id.clone())
+                .is_some()
+        })
+        .await;
+        cx.update_window(handle, |_, window, cx| {
+            window
+                .within("dialog")
+                .click(if save { "save" } else { "cancel" }, cx)
+        })
+        .unwrap();
+        wait_dialog(cx, handle, false).await;
+        let settings = Settings::read(&fixture.settings).unwrap();
+        assert_eq!(
+            settings.excluded,
+            if save {
+                vec![excluded.clone()]
+            } else {
+                Vec::new()
+            }
+        );
+    }
+    wait_count(cx, handle, 4).await;
+    assert!(excluded.join("alpha-old.txt").exists());
+    cx.update_window(handle, |_, window, cx| window.press("cmd-,", cx))
+        .unwrap();
+    wait_dialog(cx, handle, true).await;
+    cx.update_window(handle, |_, window, cx| {
+        window
+            .within("dialog")
+            .click(format!("remove-excluded-{}", excluded.display()), cx);
+        window.within("dialog").click("save", cx);
+    })
+    .unwrap();
+    wait_dialog(cx, handle, false).await;
+    wait_count(cx, handle, 6).await;
+    assert!(
+        Settings::read(&fixture.settings)
+            .unwrap()
+            .excluded
+            .is_empty()
+    );
 }

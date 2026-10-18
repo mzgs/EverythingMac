@@ -70,11 +70,13 @@ fn open(
         return;
     };
     let roots = cx.global::<Settings>().roots.clone();
+    let excluded = cx.global::<Settings>().excluded.clone();
     let form = cx.new(|cx| {
         cx.observe(&search, |_, _, cx| cx.notify()).detach();
         FolderSettings {
             path,
             roots,
+            excluded,
             search,
             error: None,
             busy: false,
@@ -93,6 +95,7 @@ fn open(
                     }
                     let settings = Settings {
                         roots: form.roots.clone(),
+                        excluded: form.excluded.clone(),
                     };
                     match settings.save(&form.path) {
                         Ok(()) => {
@@ -114,18 +117,26 @@ fn open(
 struct FolderSettings {
     path: PathBuf,
     roots: Vec<PathBuf>,
+    excluded: Vec<PathBuf>,
     search: Entity<SearchView>,
     error: Option<String>,
     busy: bool,
 }
 
 impl FolderSettings {
-    fn add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn add(&mut self, excluded: bool, window: &mut Window, cx: &mut Context<Self>) {
         let picker = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
             multiple: true,
-            prompt: Some("Index folders".into()),
+            prompt: Some(
+                if excluded {
+                    "Exclude folders"
+                } else {
+                    "Index folders"
+                }
+                .into(),
+            ),
         });
         self.busy = true;
         cx.notify();
@@ -135,9 +146,14 @@ impl FolderSettings {
                 this.busy = false;
                 match result {
                     Ok(Ok(Some(paths))) => {
+                        let folders = if excluded {
+                            &mut this.excluded
+                        } else {
+                            &mut this.roots
+                        };
                         for path in paths {
-                            if !this.roots.contains(&path) {
-                                this.roots.push(path);
+                            if !folders.contains(&path) {
+                                folders.push(path);
                             }
                         }
                     }
@@ -161,7 +177,7 @@ impl Render for FolderSettings {
         div().flex().flex_col().gap_4()
             .child(div().text_sm().text_color(cx.theme().muted_foreground)
                 .child("Choose where Everything Mac searches. Subfolders and hidden files are included. Cloud storage folders are skipped; symbolic links aren’t followed."))
-            .child(div().id("folder-list").max_h(px(300.)).overflow_y_scroll().border_1().border_color(cx.theme().border).rounded_lg().bg(cx.theme().muted)
+            .child(div().id("folder-list").max_h_40().overflow_y_scroll().border_1().border_color(cx.theme().border).rounded_lg().bg(cx.theme().muted)
                 .when(self.roots.is_empty(), |this| this.child(div().id("no-indexed-folders").test_support().flex().flex_col().items_center().gap_2().py_5()
                     .child(Icon::new(IconName::FolderPlus).size_6().text_color(cx.theme().muted_foreground))
                     .child("No folders added yet")
@@ -177,7 +193,22 @@ impl Render for FolderSettings {
                             .tooltip("Remove from index; files stay on your Mac").disabled(self.busy)
                             .on_click(cx.listener(move |this, _, _, cx| { this.roots.remove(index); cx.notify(); })))
                 })))
-            .child(Button::new("add-folder").icon(IconName::Plus).label("Add folders…").disabled(self.busy).on_click(cx.listener(|this, _, window, cx| this.add(window, cx))))
+            .child(Button::new("add-folder").icon(IconName::Plus).label("Add folders…").disabled(self.busy).on_click(cx.listener(|this, _, window, cx| this.add(false, window, cx))))
+            .child(div().flex().flex_col().gap_2()
+                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Excluded folders"))
+                .child(div().text_xs().text_color(cx.theme().muted_foreground).child("These folders and their contents are removed from the index when you save. Files stay on your Mac."))
+                .child(div().id("excluded-folder-list").max_h_40().overflow_y_scroll()
+                    .when(self.excluded.is_empty(), |this| this.child(div().py_2().text_sm().text_color(cx.theme().muted_foreground).child("No custom exclusions")))
+                    .children(self.excluded.iter().enumerate().map(|(index, path)| {
+                        div().flex().items_center().gap_3().py_2()
+                            .child(Icon::new(IconName::Folder).small().text_color(cx.theme().muted_foreground))
+                            .child(div().flex_1().min_w_0().text_sm().truncate().child(path.to_string_lossy().into_owned()))
+                            .child(Button::new(SharedString::from(format!("remove-excluded-{}", path.display()))).ghost().icon(IconName::X)
+                                .accessibility_label(format!("Stop excluding {}", path.display())).disabled(self.busy)
+                                .on_click(cx.listener(move |this, _, _, cx| { this.excluded.remove(index); cx.notify(); })))
+                    })))
+                .child(Button::new("exclude-folder").icon(IconName::Plus).label("Exclude folders…").disabled(self.busy)
+                    .on_click(cx.listener(|this, _, window, cx| this.add(true, window, cx)))))
             .child(Button::new("rebuild").ghost().icon(IconName::RefreshCw).label("Rebuild cache").tooltip("Rescan indexed folders · ⌘R").disabled(self.search.read(cx).is_scanning())
                 .on_click(cx.listener(|this, _, _, cx| this.search.update(cx, |search, cx| search.rebuild(cx)))))
             .child(div().flex().gap_2().p_3().rounded_md().bg(cx.theme().muted).text_xs().text_color(cx.theme().muted_foreground)

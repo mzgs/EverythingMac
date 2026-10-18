@@ -24,6 +24,8 @@ const APPLICATION_ID: i64 = 0x45564d43;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Checkpoint {
     pub roots: Vec<RootIdentity>,
+    #[serde(default)]
+    pub excluded: Vec<PathBuf>,
     pub event_ids: Vec<u64>,
     pub verified_at: u64,
     pub errors: Vec<(Vec<u8>, String)>,
@@ -31,7 +33,7 @@ pub(crate) struct Checkpoint {
 
 pub(crate) struct Database {
     connection: Option<Connection>,
-    pub(crate) excluded: Option<PathBuf>,
+    pub(crate) excluded: Vec<PathBuf>,
     pub(crate) warning: Option<String>,
     pending: BTreeSet<PathBuf>,
     pub checkpoint: Option<Checkpoint>,
@@ -43,7 +45,9 @@ impl Database {
             connection: None,
             excluded: path
                 .and_then(Path::parent)
-                .map(|parent| parent.canonicalize().unwrap_or_else(|_| parent.to_owned())),
+                .map(|parent| parent.canonicalize().unwrap_or_else(|_| parent.to_owned()))
+                .into_iter()
+                .collect(),
             warning: None,
             pending: BTreeSet::new(),
             checkpoint: None,
@@ -55,7 +59,7 @@ impl Database {
                 .recursive(true)
                 .mode(0o700)
                 .create(parent)?;
-            db.excluded = Some(parent.canonicalize()?);
+            db.excluded = vec![parent.canonicalize()?];
             // Create privately before SQLite opens it; existing files are never truncated.
             match fs::OpenOptions::new()
                 .write(true)
@@ -128,8 +132,8 @@ impl Database {
                     || crate::index::is_cloud_path(&path)
                     || self
                         .excluded
-                        .as_ref()
-                        .is_some_and(|excluded| path.starts_with(excluded))
+                        .iter()
+                        .any(|excluded| path.starts_with(excluded))
                 {
                     self.pending.insert(path);
                     continue;

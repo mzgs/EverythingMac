@@ -79,7 +79,11 @@ pub(crate) fn is_cloud_path(path: &Path) -> bool {
 }
 
 impl Index {
-    pub fn start(mut roots: Vec<PathBuf>, database_path: Option<PathBuf>) -> Self {
+    pub fn start(
+        mut roots: Vec<PathBuf>,
+        database_path: Option<PathBuf>,
+        mut excluded: Vec<PathBuf>,
+    ) -> Self {
         if let Ok(cwd) = std::env::current_dir() {
             for root in &mut roots {
                 if root.is_relative() {
@@ -88,7 +92,7 @@ impl Index {
             }
         }
         // FSEvents reports canonical parent paths (for example /private/var).
-        for root in &mut roots {
+        for root in roots.iter_mut().chain(&mut excluded) {
             if let (Some(parent), Some(name)) = (root.parent(), root.file_name()) {
                 if let Ok(parent) = parent.canonicalize() {
                     *root = parent.join(name);
@@ -126,6 +130,7 @@ impl Index {
             run(
                 distinct_roots,
                 database_path,
+                excluded,
                 worker_snapshot,
                 worker_stopped,
                 receiver,
@@ -162,12 +167,16 @@ impl Drop for Index {
 fn run(
     roots: Vec<PathBuf>,
     database_path: Option<PathBuf>,
+    excluded: Vec<PathBuf>,
     snapshot: Arc<RwLock<Snapshot>>,
     stopped: Arc<AtomicBool>,
     receiver: Receiver<Message>,
     event_sender: Sender<Message>,
 ) {
     let mut database = Database::open(database_path.as_deref());
+    database.excluded.extend(excluded);
+    database.excluded.sort();
+    database.excluded.dedup();
     let mut entries = database.load(&roots);
     let mut plan = fs_events::Plan::new(&roots);
     let mut identity = plan.as_ref().map(|plan| plan.identities.clone());
@@ -183,6 +192,7 @@ fn run(
     // Zero is a valid conservative checkpoint: FSEvents replays all available history.
     let saved = database.checkpoint.clone().filter(|saved| {
         identity.as_ref() == Some(&saved.roots)
+            && saved.excluded == database.excluded
             && saved.event_ids.len() == roots.len()
             && saved
                 .event_ids
@@ -254,7 +264,7 @@ fn run(
             &mut entries,
             &mut errors,
             &stopped,
-            database.excluded.as_deref(),
+            &database.excluded,
         );
         set_checkpoint(
             &mut database,
@@ -334,8 +344,8 @@ fn run(
                             || is_cloud_path(&event.path)
                             || database
                                 .excluded
-                                .as_ref()
-                                .is_some_and(|excluded| event.path.starts_with(excluded))
+                                .iter()
+                                .any(|excluded| event.path.starts_with(excluded))
                         {
                             continue;
                         }
@@ -405,7 +415,7 @@ fn run(
                 &mut entries,
                 &mut errors,
                 &stopped,
-                database.excluded.as_deref(),
+                &database.excluded,
             );
             if stopped.load(Ordering::Relaxed) {
                 return;
@@ -471,6 +481,7 @@ fn set_checkpoint(
 ) {
     database.checkpoint = roots.filter(|_| watching).map(|roots| Checkpoint {
         roots,
+        excluded: database.excluded.clone(),
         event_ids,
         verified_at,
         errors: errors
@@ -485,7 +496,7 @@ fn apply_paths(
     entries: &mut Entries,
     errors: &mut Errors,
     stopped: &AtomicBool,
-    excluded: Option<&Path>,
+    excluded: &[PathBuf],
 ) -> BTreeSet<PathBuf> {
     let mut scanned: Vec<PathBuf> = Vec::new();
     let mut changed = BTreeSet::new();
@@ -550,7 +561,7 @@ fn refresh_directory(
     entries: &mut Entries,
     errors: &mut Errors,
     stopped: &AtomicBool,
-    excluded: Option<&Path>,
+    excluded: &[PathBuf],
 ) -> BTreeSet<PathBuf> {
     let mut changed = BTreeSet::new();
     if matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
@@ -633,7 +644,7 @@ fn rebuild(
             entries,
             errors,
             stopped,
-            database.excluded.as_deref(),
+            &database.excluded,
             usize::MAX,
         );
     }
@@ -667,12 +678,12 @@ fn scan(
     entries: &mut Entries,
     errors: &mut Errors,
     stopped: &AtomicBool,
-    excluded: Option<&Path>,
+    excluded: &[PathBuf],
     depth: usize,
 ) {
     if stopped.load(Ordering::Relaxed)
         || is_cloud_path(root)
-        || excluded.is_some_and(|path| root.starts_with(path))
+        || excluded.iter().any(|path| root.starts_with(path))
     {
         return;
     }
@@ -703,7 +714,7 @@ fn scan(
                         return;
                     }
                     if is_cloud_path(&path)
-                        || excluded.is_some_and(|excluded| path.starts_with(excluded))
+                        || excluded.iter().any(|excluded| path.starts_with(excluded))
                     {
                         continue;
                     }
@@ -732,7 +743,7 @@ fn scan_folders(
     entries: &mut Entries,
     errors: &mut Errors,
     stopped: &AtomicBool,
-    excluded: Option<&Path>,
+    excluded: &[PathBuf],
 ) {
     let workers = std::thread::available_parallelism().map_or(1, usize::from);
     let (jobs, receiver) = mpsc::sync_channel::<PathBuf>(workers);
@@ -781,7 +792,7 @@ fn scan_folders(
                             break;
                         }
                         if is_cloud_path(&path)
-                            || excluded.is_some_and(|excluded| path.starts_with(excluded))
+                            || excluded.iter().any(|excluded| path.starts_with(excluded))
                         {
                             continue;
                         }
@@ -952,7 +963,7 @@ mod tests {
                 &mut entries,
                 &mut errors,
                 &AtomicBool::new(false),
-                None,
+                &[],
                 usize::MAX,
             );
             assert!(entries.is_empty() && errors.is_empty());
@@ -998,7 +1009,7 @@ mod tests {
             &mut entries,
             &mut errors,
             &stopped,
-            Some(&excluded),
+            std::slice::from_ref(&excluded),
             usize::MAX,
         );
         assert!(errors.is_empty(), "{errors:?}");
@@ -1013,7 +1024,7 @@ mod tests {
             &mut entries,
             &mut errors,
             &stopped,
-            Some(&excluded),
+            std::slice::from_ref(&excluded),
             usize::MAX,
         );
         assert_eq!(entries, previous);
@@ -1027,7 +1038,7 @@ mod tests {
         fs::write(outside.0.join("outside.txt"), "outside").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside.0, root.0.join("link")).unwrap();
-        let index = Index::start(vec![root.0.clone()], None);
+        let index = Index::start(vec![root.0.clone()], None, Vec::new());
         let snapshot = wait_for(&index, |snapshot| {
             snapshot
                 .entries
@@ -1079,7 +1090,7 @@ mod tests {
     #[test]
     fn watches_create_rename_and_delete_subtrees() {
         let root = TempDir::new();
-        let index = Index::start(vec![root.0.clone()], None);
+        let index = Index::start(vec![root.0.clone()], None, Vec::new());
         wait_for(&index, |_| true);
         let created = root.0.join("created");
         fs::create_dir(&created).unwrap();
@@ -1120,7 +1131,7 @@ mod tests {
         fs::write(target.join("file"), "contents").unwrap();
         let link = root.0.join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        let linked_index = Index::start(vec![link.clone()], None);
+        let linked_index = Index::start(vec![link.clone()], None, Vec::new());
         let linked = wait_for(&linked_index, |_| true);
         assert_eq!(linked.entries.len(), 1);
         assert_eq!(linked.entries[0].path, link);
@@ -1172,7 +1183,7 @@ mod tests {
             &mut entries,
             &mut errors,
             &stopped,
-            None,
+            &[],
             usize::MAX,
         );
         let deep = root.0.join("existing/deep/file");
@@ -1188,7 +1199,7 @@ mod tests {
         fs::write(root.0.join("file-to-dir/sub/new"), "new").unwrap();
         fs::create_dir_all(root.0.join("new/sub")).unwrap();
         fs::write(root.0.join("new/sub/new"), "new").unwrap();
-        let changed = refresh_directory(&root.0, &mut entries, &mut errors, &stopped, None);
+        let changed = refresh_directory(&root.0, &mut entries, &mut errors, &stopped, &[]);
         assert!(
             Arc::ptr_eq(&entries[&deep], &cached_deep),
             "Existing descendant entries must remain untouched"
@@ -1208,7 +1219,7 @@ mod tests {
         assert!(entries.contains_key(&root.0.join("file-to-dir/sub/new")));
         assert!(entries.contains_key(&root.0.join("new/sub/new")));
         assert!(
-            refresh_directory(&root.0, &mut entries, &mut errors, &stopped, None).is_empty(),
+            refresh_directory(&root.0, &mut entries, &mut errors, &stopped, &[]).is_empty(),
             "Replayed parent updates must be idempotent"
         );
         let changed = refresh_directory(
@@ -1216,13 +1227,13 @@ mod tests {
             &mut entries,
             &mut errors,
             &stopped,
-            None,
+            &[],
         );
         assert!(changed.contains(&deep));
         assert_eq!(entries[&deep].size, 26);
         let previous = entries.clone();
         stopped.store(true, Ordering::Relaxed);
-        assert!(refresh_directory(&root.0, &mut entries, &mut errors, &stopped, None).is_empty());
+        assert!(refresh_directory(&root.0, &mut entries, &mut errors, &stopped, &[]).is_empty());
         assert_eq!(
             entries, previous,
             "Cancellation must leave the previous index intact"
@@ -1246,17 +1257,17 @@ mod tests {
             &mut entries,
             &mut errors,
             &stopped,
-            None,
+            &[],
             usize::MAX,
         );
         fs::remove_dir_all(&folder).unwrap();
         std::os::unix::fs::symlink(&outside.0, &folder).unwrap();
-        refresh_directory(&folder, &mut entries, &mut errors, &stopped, None);
+        refresh_directory(&folder, &mut entries, &mut errors, &stopped, &[]);
         assert!(!entries[&folder].is_dir);
         assert!(!entries.contains_key(&folder.join("old")));
         assert!(!entries.contains_key(&folder.join("outside")));
         fs::remove_file(&folder).unwrap();
-        refresh_directory(&folder, &mut entries, &mut errors, &stopped, None);
+        refresh_directory(&folder, &mut entries, &mut errors, &stopped, &[]);
         assert!(!entries.contains_key(&folder));
         assert!(errors.is_empty(), "A deleted folder is not a read failure");
     }
@@ -1264,7 +1275,7 @@ mod tests {
     #[test]
     fn reports_missing_roots() {
         let root = TempDir::new();
-        let index = Index::start(vec![root.0.join("missing")], None);
+        let index = Index::start(vec![root.0.join("missing")], None, Vec::new());
         let snapshot = wait_for(&index, |_| true);
         assert_eq!(snapshot.skipped, 1);
         assert!(snapshot.scan_warning.is_some());
@@ -1301,6 +1312,63 @@ mod persistence_tests {
             assert!(Instant::now() < end, "Index timed out: {snapshot:?}");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn exclusions_prune_cached_rows_skip_live_changes_and_rescan_when_removed() {
+        let fixture = fixture();
+        let root = fixture.join("files");
+        let excluded = vec![root.join("build"), root.join("cache")];
+        for folder in ["build", "cache", "build-keep"] {
+            fs::create_dir_all(root.join(folder)).unwrap();
+            fs::write(root.join(folder).join("file"), b"fixture").unwrap();
+        }
+        let path = fixture.join("data/index.sqlite3");
+        let index = Index::start(vec![root.clone()], Some(path.clone()), Vec::new());
+        wait(&index, |s| s.entries.len() == 7);
+        drop(index);
+        let index = Index::start(vec![root.clone()], Some(path.clone()), excluded.clone());
+        let snapshot = wait(&index, |s| s.entries.len() == 3);
+        assert_eq!(snapshot.full_scans, 1);
+        let mut db = Database::open(Some(&path));
+        let cached = db.load(std::slice::from_ref(&root));
+        assert_eq!(
+            cached.len(),
+            3,
+            "Excluded rows must also be pruned from disk"
+        );
+        drop(db);
+        drop(index);
+        let index = Index::start(vec![root.clone()], Some(path.clone()), excluded.clone());
+        let snapshot = wait(&index, |s| s.entries.len() == 3);
+        assert!(
+            snapshot.replayed,
+            "Unchanged exclusions should reuse history"
+        );
+        for folder in &excluded {
+            fs::write(folder.join("new"), b"excluded").unwrap();
+        }
+        fs::write(root.join("visible"), b"visible").unwrap();
+        let snapshot = wait(&index, |s| {
+            s.entries
+                .iter()
+                .any(|entry| entry.path == root.join("visible"))
+        });
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .all(|entry| !excluded.iter().any(|path| entry.path.starts_with(path)))
+        );
+        drop(index);
+        let index = Index::start(vec![root.clone()], Some(path), Vec::new());
+        let snapshot = wait(&index, |s| s.entries.len() == 10);
+        assert_eq!(
+            snapshot.full_scans, 1,
+            "Removing exclusions needs a scan even without new events"
+        );
+        drop(index);
+        fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]
@@ -1369,7 +1437,7 @@ mod persistence_tests {
         fs::create_dir(&root).unwrap();
         fs::write(root.join("old.txt"), "old").unwrap();
         fs::write(root.join("edited.txt"), "old").unwrap();
-        let index = Index::start(vec![root.clone()], Some(db_path.clone()));
+        let index = Index::start(vec![root.clone()], Some(db_path.clone()), Vec::new());
         let first = wait(&index, |s| s.entries.len() == 3);
         assert_eq!(first.full_scans, 1);
         assert_eq!(
@@ -1386,7 +1454,7 @@ mod persistence_tests {
         let cached = db.load(&[root.clone()]);
         assert!(cached.contains_key(&root.join("old.txt")));
         assert!(!cached.contains_key(&root.join("new.txt")));
-        let index = Index::start(vec![root.clone()], Some(db_path.clone()));
+        let index = Index::start(vec![root.clone()], Some(db_path.clone()), Vec::new());
         let replayed = wait(&index, |s| {
             s.entries.len() == 4
                 && s.entries
@@ -1408,7 +1476,7 @@ mod persistence_tests {
         });
         assert!(!db.load(&[root.clone()]).contains_key(&root.join("new.txt")));
         drop(index);
-        let index = Index::start(Vec::new(), Some(db_path.clone()));
+        let index = Index::start(Vec::new(), Some(db_path.clone()), Vec::new());
         wait(&index, |s| s.entries.is_empty());
         assert!(
             db.load(&[root]).is_empty(),
@@ -1428,13 +1496,13 @@ mod persistence_tests {
             fs::write(root.join("old"), b"old").unwrap();
         }
         let path = fixture.join("cache/index.sqlite3");
-        let index = Index::start(roots.clone(), Some(path.clone()));
+        let index = Index::start(roots.clone(), Some(path.clone()), Vec::new());
         wait(&index, |s| s.entries.len() == 4);
         drop(index);
         fs::create_dir(roots[0].join("new")).unwrap();
         fs::write(roots[0].join("new/deep"), b"deep").unwrap();
         fs::remove_file(roots[1].join("old")).unwrap();
-        let index = Index::start(roots.clone(), Some(path.clone()));
+        let index = Index::start(roots.clone(), Some(path.clone()), Vec::new());
         let replayed = wait(&index, |s| {
             s.entries.len() == 5
                 && s.entries
@@ -1453,7 +1521,7 @@ mod persistence_tests {
         database.save(&cached, &BTreeSet::new(), &AtomicBool::new(false));
         assert!(database.warning.is_none());
         drop(database);
-        let index = Index::start(roots.clone(), Some(path.clone()));
+        let index = Index::start(roots.clone(), Some(path.clone()), Vec::new());
         let quiet = wait(&index, |s| s.entries.len() == 5);
         assert!(
             quiet.replayed,
@@ -1499,6 +1567,7 @@ mod persistence_tests {
         let stopped = AtomicBool::new(false);
         db.checkpoint = Some(Checkpoint {
             roots: Vec::new(),
+            excluded: Vec::new(),
             event_ids: vec![1],
             verified_at: 123,
             errors: vec![(raw.as_os_str().as_bytes().to_vec(), "denied".into())],
@@ -1549,7 +1618,7 @@ mod persistence_tests {
         fs::create_dir(&root).unwrap();
         fs::write(root.join("file"), b"old").unwrap();
         let path = fixture.join("cache/index.sqlite3");
-        let index = Index::start(vec![root.clone()], Some(path.clone()));
+        let index = Index::start(vec![root.clone()], Some(path.clone()), Vec::new());
         wait(&index, |s| s.entries.len() == 2);
         index.stop();
         // The worker stops asynchronously; serialize behind any finishing transaction.
@@ -1580,7 +1649,7 @@ mod persistence_tests {
             .execute_batch("PRAGMA user_version = 3; DELETE FROM state WHERE key = 'checkpoint';")
             .unwrap();
         fs::write(root.join("new"), b"new").unwrap();
-        let index = Index::start(vec![root.clone()], Some(path.clone()));
+        let index = Index::start(vec![root.clone()], Some(path.clone()), Vec::new());
         let built = wait(&index, |s| s.entries.len() == 3);
         assert_eq!(
             built.full_scans, 1,
@@ -1591,7 +1660,7 @@ mod persistence_tests {
         let added = fixture.join("added");
         fs::create_dir(&added).unwrap();
         fs::write(added.join("child"), b"new root").unwrap();
-        let index = Index::start(vec![root.clone(), added.clone()], Some(path));
+        let index = Index::start(vec![root.clone(), added.clone()], Some(path), Vec::new());
         let built = wait(&index, |s| {
             s.entries.iter().any(|e| e.path == added.join("child"))
         });
@@ -1647,7 +1716,7 @@ mod persistence_tests {
         let db_path = fixture.join("cache/index.sqlite3");
         fs::create_dir(db_path.parent().unwrap()).unwrap();
         fs::write(&db_path, "broken database").unwrap();
-        let index = Index::start(vec![fixture.clone()], Some(db_path.clone()));
+        let index = Index::start(vec![fixture.clone()], Some(db_path.clone()), Vec::new());
         let snapshot = wait(&index, |s| s.warning.is_some());
         assert!(snapshot.warning.unwrap().contains("database"));
         assert!(

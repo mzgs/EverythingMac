@@ -125,7 +125,10 @@ fn main() {
         Ok((path, settings)) => (Some(path), settings, None),
         Err(error) => (
             None,
-            Settings { roots: Vec::new() },
+            Settings {
+                roots: Vec::new(),
+                excluded: Vec::new(),
+            },
             Some(format!(
                 "Couldn’t load settings: {error}. Existing files are preserved and saving is disabled. Fix the file or folder permissions, then restart the app."
             )),
@@ -212,6 +215,23 @@ fn main() {
             KeyBinding::new("up", search_view::PreviousResult, Some("Everything")),
             KeyBinding::new("enter", search_view::OpenResult, Some("Everything")),
             KeyBinding::new("space", search_view::QuickLook, Some("FileResults")),
+            KeyBinding::new("cmd-a", search_view::SelectAllResults, Some("FileResults")),
+            KeyBinding::new("cmd-c", search_view::CopyFiles, Some("FileResults")),
+            KeyBinding::new(
+                "cmd-backspace",
+                search_view::TrashResults,
+                Some("FileResults"),
+            ),
+            KeyBinding::new(
+                "shift-down",
+                search_view::ExtendNextResult,
+                Some("FileResults"),
+            ),
+            KeyBinding::new(
+                "shift-up",
+                search_view::ExtendPreviousResult,
+                Some("FileResults"),
+            ),
             KeyBinding::new("cmd-,", OpenSettings, None),
             #[cfg(not(target_os = "macos"))]
             KeyBinding::new("ctrl-q", Quit, None),
@@ -230,7 +250,7 @@ fn main() {
             name: "Everything Mac".into(),
             disabled: false,
             items: vec![
-                MenuItem::action("Indexed folders…", OpenSettings),
+                MenuItem::action("Settings…", OpenSettings),
                 MenuItem::action("Search help", search_view::SearchHelp),
                 MenuItem::separator(),
                 MenuItem::action("Quit", Quit),
