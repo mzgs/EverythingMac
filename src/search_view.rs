@@ -142,6 +142,15 @@ impl SearchView {
         view
     }
 
+    pub(crate) fn is_scanning(&self) -> bool {
+        self.snapshot.scanning
+    }
+
+    pub(crate) fn rebuild(&mut self, cx: &mut Context<Self>) {
+        self.index.refresh();
+        cx.notify();
+    }
+
     fn search(&mut self, window: &mut Window, cx: &mut Context<Self>, reveal_selection: bool) {
         self.pending_open = None;
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
@@ -388,7 +397,7 @@ impl Render for SearchView {
         div().size_full().flex().flex_col().bg(cx.theme().title_bar).text_color(cx.theme().foreground)
             .key_context("Everything")
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| this.input.update(cx, |input, cx| input.focus(window, cx))))
-            .on_action(cx.listener(|this, _: &RebuildIndex, _, cx| { this.index.refresh(); cx.notify(); }))
+            .on_action(cx.listener(|this, _: &RebuildIndex, _, cx| this.rebuild(cx)))
             .on_action(cx.listener(|this, _: &OpenResult, window, cx| this.open(false, window, cx)))
             .on_action(cx.listener(|this, _: &RevealResult, window, cx| this.open(true, window, cx)))
             .on_action(cx.listener(|this, _: &CopyPath, _, cx| this.copy(cx)))
@@ -403,12 +412,7 @@ impl Render for SearchView {
                     .child(div().flex().flex_col().gap_1()
                         .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Everything Mac"))
                         .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Your files, a few keystrokes away."))))
-                .child(div().flex().items_center().gap_2()
-                    .child(Button::new("folders").icon(IconName::FolderCog).label("Indexed folders").tooltip("Choose folders to search · ⌘,").on_click(|_, window, cx| window.dispatch_action(Box::new(crate::OpenSettings), cx)))
-                    .child(Button::new("rebuild").ghost().icon(IconName::RefreshCw).label("Rebuild").tooltip("Rescan indexed folders · ⌘R").disabled(self.snapshot.scanning).on_click(cx.listener(|this, _, _, cx| { this.index.refresh(); cx.notify(); })))
-                    .child(Button::new("full-disk-access").ghost().icon(IconName::TriangleAlert).accessibility_label("Needs Full Disk Access")
-                        .tooltip(self.snapshot.scan_warning.clone().unwrap_or_else(|| "Open Full Disk Access in System Settings".into()))
-                        .on_click(|_, _, cx| cx.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")))))
+                .child(Button::new("folders").icon(IconName::FolderCog).label("Indexed folders").tooltip("Choose folders to search · ⌘,").on_click(|_, window, cx| window.dispatch_action(Box::new(crate::OpenSettings), cx))))
             .child(div().flex().items_center().gap_2().px_5().pb_3()
                 .child(div().flex_1().min_w_0().child(Input::new(&self.input).id("search-input").aria_label("Search files and folders")
                 .prefix(Icon::new(IconName::Search).small().text_color(cx.theme().muted_foreground))
@@ -494,7 +498,10 @@ impl Render for SearchView {
                 .child(Button::new("reveal").ghost().small().icon(IconName::FolderOpen).label("Show in Finder").tooltip("Reveal selected result · ⌘Return").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.open(true, window, cx))))
                 .child(Button::new("copy-path").ghost().small().icon(IconName::Copy).label("Copy path").tooltip("Copy full path · ⇧⌘C").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, _, cx| this.copy(cx))))
                 .child(div().flex_1())
-                .child(div().text_xs().text_color(cx.theme().muted_foreground).child("↑ ↓ Navigate    ↵ Open    ⌘ ↵ Reveal")))
+                .child(Button::new("full-disk-access").ghost().small().icon(IconName::TriangleAlert).accessibility_label("Needs Full Disk Access")
+                    .tooltip(self.snapshot.scan_warning.clone().unwrap_or_else(|| "Open Full Disk Access in System Settings".into()))
+                    .on_click(|_, _, cx| cx.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")))
+                .child(div().id("navigation-hints").test_support().text_xs().text_color(cx.theme().muted_foreground).child("↑ ↓ Navigate    ↵ Open    ⌘ ↵ Reveal")))
             .children(self.snapshot.warning.clone().map(|warning| div().id("index-warnings").test_support().role(Role::Status).aria_label(warning.clone()).max_h(px(80.)).overflow_y_scroll().px_5().pb_2().bg(cx.theme().status_bar).text_xs().text_color(cx.theme().muted_foreground).child(warning)))
     }
 }
@@ -580,12 +587,65 @@ fn format_modified(time: Option<SystemTime>) -> String {
 mod tests {
     use super::{SearchView, format_count, format_size, kind_matches};
     use crate::{index::Entry, settings::Settings};
-    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
     use gpui_kit::{AppContext, ScrollStrategy, TestAppContext};
     use std::{path::PathBuf, sync::Arc};
 
     #[gpui_kit::test]
-    fn access_icon_stays_in_header_and_opens_full_disk_access(cx: &mut TestAppContext) {
+    async fn rebuild_cache_is_in_settings_and_rescans(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, view) = cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            cx.set_global(Settings { roots: Vec::new() });
+            let (handle, view) =
+                gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                    window.set_scroll_layers(false);
+                    cx.new(|cx| SearchView::new(None, window, cx))
+                })
+                .unwrap();
+            crate::settings_view::register_action(
+                handle,
+                view.clone(),
+                Some(PathBuf::from("unused-settings.json")),
+                None,
+                cx,
+            );
+            (handle, view)
+        });
+        cx.wait_for(handle, std::time::Duration::from_secs(3), |_, cx| {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            !view.read(cx).is_scanning()
+        })
+        .await;
+        let scans = cx.update(|cx| view.read(cx).index.snapshot().full_scans);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("rebuild").is_none());
+            window.click("folders", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle, std::time::Duration::from_secs(3), |window, _| {
+            window.within("dialog").try_find("rebuild").is_some()
+        })
+        .await;
+        cx.update_window(handle, |_, window, cx| {
+            assert_eq!(
+                window.within("dialog").find("rebuild").label(),
+                Some("Rebuild cache")
+            );
+            window.within("dialog").click("rebuild", cx);
+            assert!(window.try_find("dialog").is_some());
+        })
+        .unwrap();
+        cx.wait_for(handle, std::time::Duration::from_secs(3), |_, cx| {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            view.read(cx).index.snapshot().full_scans > scans
+        })
+        .await;
+    }
+
+    #[gpui_kit::test]
+    fn access_icon_stays_left_of_navigation_and_opens_full_disk_access(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         cx.update(|cx| cx.set_global(Settings { roots: Vec::new() }));
         let (window, view) = cx.update(|cx| {
@@ -616,6 +676,11 @@ mod tests {
                     window.find("full-disk-access").label(),
                     Some("Needs Full Disk Access")
                 );
+                let icon = window.find("full-disk-access").bounds();
+                let navigation = window.find("navigation-hints").bounds();
+                assert!(icon.right() <= navigation.origin.x);
+                assert!(icon.origin.y <= navigation.origin.y);
+                assert!(icon.bottom() >= navigation.bottom());
                 assert_eq!(
                     window.find("index-warnings").label(),
                     Some("Index database unavailable")

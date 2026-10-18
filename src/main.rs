@@ -82,8 +82,12 @@ impl Render for AppView {
 
 fn init_theme(cx: &mut App) {
     Theme::update(cx, |theme| {
-        std::rc::Rc::make_mut(&mut theme.light_theme).colors.selection = Some("#007aff33".into());
-        std::rc::Rc::make_mut(&mut theme.dark_theme).colors.selection = Some("#0a84ff4d".into());
+        std::rc::Rc::make_mut(&mut theme.light_theme)
+            .colors
+            .selection = Some("#007aff33".into());
+        std::rc::Rc::make_mut(&mut theme.dark_theme)
+            .colors
+            .selection = Some("#0a84ff4d".into());
     });
     Theme::change(cx.theme().mode, None, cx);
 }
@@ -185,7 +189,7 @@ fn main() {
         let database_path = settings_path
             .as_ref()
             .map(|path| path.with_file_name("index.sqlite3"));
-        let (handle, _) = gpui_kit::open_window(options, cx, |window, cx| {
+        let (handle, view) = gpui_kit::open_window(options, cx, |window, cx| {
             Theme::sync_system_appearance(Some(window), cx);
             window
                 .observe_window_appearance(|window, cx| {
@@ -212,7 +216,13 @@ fn main() {
             KeyBinding::new("ctrl-,", OpenSettings, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
-        settings_view::register_action(handle, settings_path, startup_error.clone(), cx);
+        settings_view::register_action(
+            handle,
+            view.read(cx).search.clone(),
+            settings_path,
+            startup_error.clone(),
+            cx,
+        );
         cx.set_menus(vec![Menu {
             name: "Everything Mac".into(),
             disabled: false,

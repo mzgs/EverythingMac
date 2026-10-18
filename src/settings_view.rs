@@ -1,4 +1,4 @@
-use crate::settings::Settings;
+use crate::{search_view::SearchView, settings::Settings};
 use gpui_kit::assets::IconName;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 pub(crate) fn register_action(
     handle: AnyWindowHandle,
+    search: Entity<SearchView>,
     path: Option<PathBuf>,
     error: Option<String>,
     cx: &mut App,
@@ -20,10 +21,11 @@ pub(crate) fn register_action(
     cx.on_action(move |_: &crate::OpenSettings, cx| {
         let path = path.clone();
         let error = error.clone();
+        let search = search.clone();
         cx.defer(move |cx| {
-            if let Err(error) =
-                cx.update_window(handle, |_, window, cx| open(path, error, window, cx))
-            {
+            if let Err(error) = cx.update_window(handle, |_, window, cx| {
+                open(path, error, search, window, cx)
+            }) {
                 eprintln!("Couldn’t open settings: {error}");
             }
         });
@@ -35,19 +37,25 @@ pub(crate) fn show_error(message: String, window: &mut Window, cx: &mut App) {
     // Selection must repaint immediately instead of waiting for the search poll.
     selection.refresh_window_on_change(window, cx).detach();
     window.open_alert_dialog(cx, move |dialog, _, _| {
-        dialog.title("Everything Mac").description(
-            div().id("dialog-message").test_support().child(
+        dialog
+            .title("Everything Mac")
+            .description(div().id("dialog-message").test_support().child(
                 gpui_kit::base::SelectableText::with_handle(
                     "dialog-text",
                     selection.clone(),
                     message.clone(),
                 ),
-            ),
-        )
+            ))
     });
 }
 
-fn open(path: Option<PathBuf>, error: Option<String>, window: &mut Window, cx: &mut App) {
+fn open(
+    path: Option<PathBuf>,
+    error: Option<String>,
+    search: Entity<SearchView>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     if window.has_active_dialog(cx) {
         return;
     }
@@ -62,11 +70,15 @@ fn open(path: Option<PathBuf>, error: Option<String>, window: &mut Window, cx: &
         return;
     };
     let roots = cx.global::<Settings>().roots.clone();
-    let form = cx.new(|_| FolderSettings {
-        path,
-        roots,
-        error: None,
-        busy: false,
+    let form = cx.new(|cx| {
+        cx.observe(&search, |_, _, cx| cx.notify()).detach();
+        FolderSettings {
+            path,
+            roots,
+            search,
+            error: None,
+            busy: false,
+        }
     });
     window.open_dialog(cx, move |dialog, _, _| {
         let confirm = form.clone();
@@ -102,6 +114,7 @@ fn open(path: Option<PathBuf>, error: Option<String>, window: &mut Window, cx: &
 struct FolderSettings {
     path: PathBuf,
     roots: Vec<PathBuf>,
+    search: Entity<SearchView>,
     error: Option<String>,
     busy: bool,
 }
@@ -165,6 +178,8 @@ impl Render for FolderSettings {
                             .on_click(cx.listener(move |this, _, _, cx| { this.roots.remove(index); cx.notify(); })))
                 })))
             .child(Button::new("add-folder").icon(IconName::Plus).label("Add folders…").disabled(self.busy).on_click(cx.listener(|this, _, window, cx| this.add(window, cx))))
+            .child(Button::new("rebuild").ghost().icon(IconName::RefreshCw).label("Rebuild cache").tooltip("Rescan indexed folders · ⌘R").disabled(self.search.read(cx).is_scanning())
+                .on_click(cx.listener(|this, _, _, cx| this.search.update(cx, |search, cx| search.rebuild(cx)))))
             .child(div().flex().gap_2().p_3().rounded_md().bg(cx.theme().muted).text_xs().text_color(cx.theme().muted_foreground)
                 .child(Icon::new(IconName::ShieldCheck).small().flex_shrink_0())
                 .child(div().flex_1().min_w_0().child("Files stay on your Mac. Only names and metadata are indexed. For protected folders, allow access in macOS or grant Full Disk Access in System Settings, then rebuild.")))

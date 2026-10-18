@@ -25,7 +25,7 @@ GPUI Fast's scroll-tile cache is disabled at startup because version 0.1.6 can o
 
 ## Search
 
-Your home folder is indexed by default. Open **Indexed folders** (`⌘,`) to add/remove folders or mounted volumes, then save. Nested roots are deduplicated by the indexer. Hidden files are included; symbolic links are listed without following them. Names, sizes and modified times are scanned in the background; file contents are never read by the indexer.
+Your home folder is indexed by default. Open **Indexed folders** (`⌘,`) to add/remove folders or mounted volumes, then save. **Rebuild cache** is also available in this settings dialog to rescan the saved indexed folders. Nested roots are deduplicated by the indexer. Hidden files are included; symbolic links are listed without following them. Names, sizes and modified times are scanned in the background; file contents are never read by the indexer.
 
 Search updates as you type. Results are virtualized and can be sorted by name, path, size, or modified time. Click a header again to reverse its sort. Filter by files, folders, audio, images, videos, or documents. Double-click or press Return to open the selected result with its default app; `⌘Return` reveals it in Finder and `⇧⌘C` copies its full path. `⌘F` focuses search, `↑`/`↓` select results, and `⌘R` rebuilds the index.
 
@@ -49,7 +49,7 @@ Native macOS FSEvents tracks creates, renames, edits and removals. Ordinary dire
 
 ## Access and saved data
 
-macOS controls access to protected folders. Accept folder-access prompts or grant **Everything Mac** Full Disk Access in System Settings → Privacy & Security, relaunch, and rebuild if needed. When running through Cargo, macOS may attribute access to the terminal/developer host. A fixed exclamation icon at the top right opens Full Disk Access directly in System Settings; scan-error details are available on hover. Permissions are not polled; database and watcher failures are shown separately.
+macOS controls access to protected folders. Accept folder-access prompts or grant **Everything Mac** Full Disk Access in System Settings → Privacy & Security, relaunch, and rebuild if needed. When running through Cargo, macOS may attribute access to the terminal/developer host. A fixed exclamation icon in the bottom bar, left of Navigate, opens Full Disk Access directly in System Settings; scan-error details are available on hover. Permissions are not polled; database and watcher failures are shown separately.
 
 The index is saved in `~/Library/Application Support/eveythingmac/index.sqlite3`. The first launch builds it; later launches show an early preview of the first 1,024 cached entries while the rest load, then replay saved FSEvents history to reconcile paths changed while the app was closed. Each watched root keeps its own volume event checkpoint, root identity and volume-history UUID. Previously inaccessible paths are retried at startup. Checkpoints and changed file rows commit in one SQLite transaction, so an interrupted save cannot move the checkpoint beyond the saved index. Cached results can briefly be incomplete or outdated while background loading and reconciliation finish.
 

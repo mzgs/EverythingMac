@@ -59,7 +59,7 @@ impl Fixture {
                 KeyBinding::new("cmd-f", search_view::FocusSearch, Some("Everything")),
                 KeyBinding::new("cmd-,", OpenSettings, None),
             ]);
-            let (handle, _) = gpui_kit::open_window(
+            let (handle, view) = gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds {
                         origin: Point::default(),
@@ -83,7 +83,13 @@ impl Fixture {
                 },
             )
             .unwrap();
-            settings_view::register_action(handle, Some(self.settings.clone()), None, cx);
+            settings_view::register_action(
+                handle,
+                view.read(cx).search.clone(),
+                Some(self.settings.clone()),
+                None,
+                cx,
+            );
             handle
         })
     }
