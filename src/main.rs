@@ -80,6 +80,14 @@ impl Render for AppView {
     }
 }
 
+fn init_theme(cx: &mut App) {
+    Theme::update(cx, |theme| {
+        std::rc::Rc::make_mut(&mut theme.light_theme).colors.selection = Some("#007aff33".into());
+        std::rc::Rc::make_mut(&mut theme.dark_theme).colors.selection = Some("#0a84ff4d".into());
+    });
+    Theme::change(cx.theme().mode, None, cx);
+}
+
 fn main() {
     // shortcut: gpui-fast 0.1.6 scroll tiles overflow large/HiDPI lists; remove after an upstream fix.
     // SAFETY: This runs before any application or index worker threads start.
@@ -149,6 +157,7 @@ fn main() {
     });
     application.run(move |cx| {
         gpui_kit::init(cx);
+        init_theme(cx);
         cx.set_global(settings);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {

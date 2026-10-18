@@ -47,6 +47,7 @@ impl Fixture {
 
     fn open(&self, cx: &mut TestAppContext) -> AnyWindowHandle {
         cx.update(gpui_kit::init);
+        cx.update(crate::init_theme);
         cx.update(|cx| {
             cx.set_reduce_motion(true);
             cx.set_global(Settings {
@@ -117,6 +118,47 @@ fn type_query(window: &mut Window, cx: &mut App, query: &str) {
     window.click("search-input", cx);
     window.press("cmd-a", cx);
     window.input(query, cx);
+}
+
+#[gpui_kit::test]
+async fn help_text_can_be_selected_and_copied_but_not_edited(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    cx.update_window(handle, |_, window, cx| window.click("help", cx))
+        .unwrap();
+    wait_dialog(cx, handle, true).await;
+    cx.update_window(handle, |_, window, cx| {
+        let bounds = window.find("dialog-message").bounds();
+        let start = bounds.origin + gpui_kit::point(px(0.1), px(10.));
+        let end = gpui_kit::point(bounds.right() - px(0.1), bounds.bottom() - px(0.1));
+        window.drag(start, end, cx);
+        window.press("cmd-c", cx);
+        let message = cx.read_from_clipboard().unwrap().text().unwrap();
+        assert!(message.starts_with("Search filenames as you type."));
+        assert!(message.contains("*.pdf | *.docx"));
+        assert!(message.contains("<cat | dog> photo"));
+        assert!(message.contains("budget — both words\n\"annual report\" — exact phrase\n"));
+        assert!(message.contains("extension filter\nfile: / folder: — kind\n"));
+        assert!(message.contains("⌘, Folders"));
+        window.input("replacement", cx);
+        window.drag(start, end, cx);
+        window.press("cmd-c", cx);
+        assert_eq!(cx.read_from_clipboard().unwrap().text(), Some(message));
+        let origin = window.find("dialog-message").bounds().origin;
+        window.drag(
+            origin + gpui_kit::point(px(8.), px(10.)),
+            origin + gpui_kit::point(px(150.), px(10.)),
+            cx,
+        );
+        window.press("cmd-c", cx);
+        let selected = cx.read_from_clipboard().unwrap().text().unwrap();
+        assert!(!selected.is_empty());
+        assert!("Search filenames as you type.".contains(selected.trim()));
+        window.press("escape", cx);
+    })
+    .unwrap();
+    wait_dialog(cx, handle, false).await;
 }
 
 #[gpui_kit::test]

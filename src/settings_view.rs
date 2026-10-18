@@ -31,8 +31,19 @@ pub(crate) fn register_action(
 }
 
 pub(crate) fn show_error(message: String, window: &mut Window, cx: &mut App) {
+    let selection = gpui_kit::base::TextSelectionHandle::new(message.clone(), cx);
+    // Selection must repaint immediately instead of waiting for the search poll.
+    selection.refresh_window_on_change(window, cx).detach();
     window.open_alert_dialog(cx, move |dialog, _, _| {
-        dialog.title("Everything Mac").description(message.clone())
+        dialog.title("Everything Mac").description(
+            div().id("dialog-message").test_support().child(
+                gpui_kit::base::SelectableText::with_handle(
+                    "dialog-text",
+                    selection.clone(),
+                    message.clone(),
+                ),
+            ),
+        )
     });
 }
 
