@@ -57,6 +57,23 @@ enum SearchQuery {
     Content(Option<String>),
 }
 
+impl SearchQuery {
+    fn parse(
+        text: &str,
+        case: bool,
+        path: bool,
+        regex: bool,
+        content: bool,
+        fuzzy: bool,
+    ) -> Result<Self, String> {
+        if content {
+            content_search::predicate(text, case).map(Self::Content)
+        } else {
+            Query::parse(text, case, path, regex, fuzzy && !regex).map(Self::Filename)
+        }
+    }
+}
+
 struct FilterResults {
     results: Arc<Vec<Arc<Entry>>>,
     selected: Option<usize>,
@@ -242,18 +259,14 @@ impl SearchView {
     }
 
     fn parse_query(&self, text: &str) -> Result<SearchQuery, String> {
-        if self.content {
-            content_search::predicate(text, self.case).map(SearchQuery::Content)
-        } else {
-            Query::parse(
-                text,
-                self.case,
-                self.path,
-                self.regex,
-                self.fuzzy && !self.regex,
-            )
-            .map(SearchQuery::Filename)
-        }
+        SearchQuery::parse(
+            text,
+            self.case,
+            self.path,
+            self.regex,
+            self.content,
+            self.fuzzy,
+        )
     }
 
     fn save_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -629,20 +642,8 @@ impl SearchView {
             return;
         }
         let text = self.input.read(cx).value();
-        let query = match self.parse_query(&text) {
-            Ok(query) => query,
-            Err(error) => {
-                self.starting = false;
-                self.error = Some(error);
-                self.results = Arc::new(Vec::new());
-                self.selected = None;
-                self.selected_paths = Arc::new(BTreeSet::new());
-                self.selection_anchor = None;
-                self.searching = false;
-                cx.notify();
-                return;
-            }
-        };
+        let (content, case, path, regex, fuzzy) =
+            (self.content, self.case, self.path, self.regex, self.fuzzy);
         self.error = None;
         self.searching = true;
         let revision = self.snapshot.revision;
@@ -666,6 +667,8 @@ impl SearchView {
                     if matching_generation.load(Ordering::Relaxed) != generation {
                         return Ok(None);
                     }
+                    // Compile only the debounced query, away from keyboard handling.
+                    let query = SearchQuery::parse(&text, case, path, regex, content, fuzzy)?;
                     let content_paths = match &query {
                         // shortcut: Spotlight changes refresh on the next search; subscribe if live content updates are needed.
                         SearchQuery::Content(predicate) => {
@@ -860,19 +863,23 @@ impl SearchView {
             .selected
             .and_then(|i| self.results.get(i))
             .map(|entry| &entry.path);
-        let mut paths: BTreeSet<_> = results
-            .iter()
-            .filter(|entry| self.selected_paths.contains(&entry.path))
-            .map(|entry| entry.path.clone())
-            .collect();
-        self.selected = active
-            .and_then(|path| {
-                results
-                    .iter()
-                    .position(|entry| &entry.path == path && paths.contains(path))
-            })
-            .or_else(|| results.iter().position(|entry| paths.contains(&entry.path)))
-            .or_else(|| (!results.is_empty()).then_some(0));
+        let mut paths = BTreeSet::new();
+        let mut selected = None;
+        if !self.selected_paths.is_empty() {
+            for (i, entry) in results.iter().enumerate() {
+                if self.selected_paths.contains(&entry.path) {
+                    paths.insert(entry.path.clone());
+                    if selected.is_none() || active == Some(&entry.path) {
+                        selected = Some(i);
+                    }
+                    // Widening a query usually retains the selection near the top.
+                    if paths.len() == self.selected_paths.len() {
+                        break;
+                    }
+                }
+            }
+        }
+        self.selected = selected.or_else(|| (!results.is_empty()).then_some(0));
         if paths.is_empty()
             && let Some(i) = self.selected
         {
@@ -1605,6 +1612,127 @@ mod tests {
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
     use gpui_kit::{AppContext, ScrollStrategy, TestAppContext};
     use std::{path::PathBuf, sync::Arc};
+
+    #[gpui_kit::test]
+    async fn deleting_input_does_not_compile_queries_inline_or_publish_stale_errors(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            cx.set_global(Settings {
+                roots: Vec::new(),
+                excluded: Vec::new(),
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::size(gpui_kit::px(1050.), gpui_kit::px(450.)),
+            |window, cx| SearchView::new(None, window, cx),
+        );
+        window
+            .update(cx, |view, _, _| {
+                view._poll = gpui_kit::Task::ready(());
+                view.search_task = None;
+                view.regex = true;
+                view.snapshot.entries = Arc::new(vec![Arc::new(Entry {
+                    path: "/fixture/file.txt".into(),
+                    is_dir: false,
+                    size: 0,
+                    allocated_size: 0,
+                    modified: None,
+                })]);
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.click("search-input", cx);
+            window.input("[", cx);
+        })
+        .unwrap();
+        let invalid = window
+            .update(cx, |view, _, _| {
+                assert!(view.error.is_none(), "Parsing must run on the worker");
+                view.search_task.take().unwrap()
+            })
+            .unwrap();
+        invalid.await;
+        window
+            .update(cx, |view, _, _| assert!(view.error.is_some()))
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.press("backspace", cx);
+            assert_eq!(window.find("search-input").value(), Some(""));
+            window.input("[é]", cx);
+            for expected in ["[é", "[", ""] {
+                window.press("backspace", cx);
+                assert_eq!(window.find("search-input").value(), Some(expected));
+            }
+        })
+        .unwrap();
+        let latest = window
+            .update(cx, |view, _, _| view.search_task.take().unwrap())
+            .unwrap();
+        latest.await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(view.error.is_none());
+                assert!(!view.searching);
+                assert_eq!(view.results.len(), 1);
+            })
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn applying_results_preserves_active_selection_and_handles_removed_paths(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            cx.set_global(Settings {
+                roots: Vec::new(),
+                excluded: Vec::new(),
+            });
+        });
+        let window = cx.add_window(|window, cx| SearchView::new(None, window, cx));
+        window
+            .update(cx, |view, _, cx| {
+                view._poll = gpui_kit::Task::ready(());
+                view.search_task = None;
+                let entries: Vec<_> = ["a", "b", "c"]
+                    .map(|name| {
+                        Arc::new(Entry {
+                            path: PathBuf::from(name),
+                            is_dir: false,
+                            size: 0,
+                            allocated_size: 0,
+                            modified: None,
+                        })
+                    })
+                    .into();
+                view.results = Arc::new(entries.clone());
+                view.selected = Some(2);
+                view.selected_paths = Arc::new([PathBuf::from("a"), PathBuf::from("c")].into());
+                view.selection_anchor = Some(PathBuf::from("c"));
+                for (next, expected, paths) in [
+                    (vec![2, 1, 0], Some(0), vec!["a", "c"]),
+                    (vec![0, 1], Some(0), vec!["a"]),
+                    (vec![1], Some(0), vec!["b"]),
+                    (vec![], None, vec![]),
+                    (vec![1, 2], Some(0), vec!["b"]),
+                ] {
+                    let results = next.into_iter().map(|i| entries[i].clone()).collect();
+                    view.set_results(Arc::new(results), cx, false);
+                    assert_eq!(view.selected, expected);
+                    assert_eq!(
+                        *view.selected_paths,
+                        paths.into_iter().map(PathBuf::from).collect()
+                    );
+                    assert_eq!(
+                        view.selection_anchor,
+                        expected.map(|i| view.results[i].path.clone())
+                    );
+                }
+            })
+            .unwrap();
+    }
 
     #[gpui_kit::test]
     fn drag_payload_contains_selected_paths_and_directory_metadata(cx: &mut TestAppContext) {
