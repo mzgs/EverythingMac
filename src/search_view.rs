@@ -385,7 +385,7 @@ impl Render for SearchView {
                 "Try fewer words, a different file type, or reset your search.",
             )
         };
-        div().size_full().flex().flex_col().bg(cx.theme().background).text_color(cx.theme().foreground)
+        div().size_full().flex().flex_col().bg(cx.theme().title_bar).text_color(cx.theme().foreground)
             .key_context("Everything")
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| this.input.update(cx, |input, cx| input.focus(window, cx))))
             .on_action(cx.listener(|this, _: &RebuildIndex, _, cx| { this.index.refresh(); cx.notify(); }))
@@ -410,7 +410,7 @@ impl Render for SearchView {
                     .child(Button::new("full-disk-access").ghost().icon(IconName::TriangleAlert).accessibility_label("Needs Full Disk Access")
                         .tooltip(self.snapshot.scan_warning.clone().unwrap_or_else(|| "Open Full Disk Access in System Settings".into()))
                         .on_click(|_, _, cx| cx.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")))))
-            .child(div().px_5().pb_3().child(Input::new(&self.input).id("search-input").aria_label("Search files and folders").large()
+            .child(div().px_5().pb_3().child(Input::new(&self.input).id("search-input").aria_label("Search files and folders")
                 .prefix(Icon::new(IconName::Search).small().text_color(cx.theme().muted_foreground))
                 .suffix(div().text_xs().text_color(cx.theme().muted_foreground).child("⌘ F"))
                 .cleanable(true)))
@@ -430,18 +430,18 @@ impl Render for SearchView {
             .children(self.error.clone().map(|error| div().id("search-error").test_support().role(Role::Status).aria_label(error.clone())
                 .mx_5().mb_3().px_3().py_2().rounded_md().bg(cx.theme().danger.opacity(0.08)).flex().items_center().gap_2().text_sm().text_color(cx.theme().danger)
                 .child(Icon::new(IconName::CircleAlert).small().flex_shrink_0()).child(div().flex_1().min_w_0().child(error))))
-            .child(div().flex().items_center().justify_between().px_5().py_2().border_t_1().border_color(cx.theme().border)
+            .child(div().flex().items_center().justify_between().px_5().py_2().border_t_1().border_color(cx.theme().border).bg(cx.theme().table)
                 .child(div().flex().items_center().gap_2()
                     .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Results"))
                     .child(div().id("result-count").test_support().role(Role::Status).aria_label(format!("{} matches", self.results.len()))
                         .text_xs().text_color(cx.theme().muted_foreground).child(format!("{} matches", format_count(self.results.len()))))))
-            .child(div().flex().items_center().px_5().border_y_1().border_color(cx.theme().border).bg(cx.theme().muted.opacity(0.4)).text_color(cx.theme().muted_foreground)
+            .child(div().flex().items_center().px_5().border_y_1().border_color(cx.theme().border).bg(cx.theme().muted).text_color(cx.theme().muted_foreground)
                 .child(self.heading("Name", Sort::Name, 280., cx))
                 .child(div().flex_1().min_w_0().child(self.heading("Path", Sort::Path, 140., cx)))
                 .child(self.heading("Size", Sort::Size, 90., cx))
                 .child(div().w(px(90.)).text_sm().py_2().child("Type"))
                 .child(self.heading("Modified", Sort::Modified, 110., cx)))
-            .child(div().id("results-table").test_support().role(Role::Table).aria_label(format!("{} results", self.results.len())).aria_row_count(self.results.len()).relative().flex_1().min_h_0().child(
+            .child(div().id("results-table").test_support().role(Role::Table).aria_label(format!("{} results", self.results.len())).aria_row_count(self.results.len()).relative().flex_1().min_h_0().bg(cx.theme().table).child(
                 uniform_list("results", results.len(), move |range, _, cx| {
                     range.map(|i| {
                         let entry = &results[i];
@@ -451,8 +451,8 @@ impl Render for SearchView {
                         let owner = owner.clone();
                         div().id(("result", i)).test_support().role(Role::Row).aria_label(entry.path.to_string_lossy().into_owned())
                             .aria_selected(selected == Some(i)).flex().items_center().h(px(36.)).px_5().text_sm().w_full().cursor_pointer()
-                            .when(i % 2 == 1, |row| row.bg(cx.theme().muted.opacity(0.16)))
-                            .hover(|row| row.bg(if selected == Some(i) { cx.theme().link.opacity(0.18) } else { cx.theme().muted.opacity(0.5) }))
+                            .when(i % 2 == 1, |row| row.bg(cx.theme().table_even))
+                            .hover(|row| row.bg(if selected == Some(i) { cx.theme().link.opacity(0.18) } else { cx.theme().table_hover }))
                             .when(selected == Some(i), |row| row.bg(cx.theme().link.opacity(0.12)))
                             .child(div().w(px(280.)).flex_shrink_0().pr_3().flex().items_center().gap_2()
                                 .child(Icon::new(if entry.is_dir { IconName::Folder } else { IconName::File }).small().flex_shrink_0()
@@ -488,13 +488,13 @@ impl Render for SearchView {
                             this.input.update(cx, |input, cx| { input.set_value("", window, cx); input.focus(window, cx); });
                             this.search(window, cx, true);
                         })))))))
-            .child(div().flex().items_center().gap_2().px_5().py_3().border_t_1().border_color(cx.theme().border)
+            .child(div().flex().items_center().gap_2().px_5().py_3().border_t_1().border_color(cx.theme().border).bg(cx.theme().status_bar)
                 .child(Button::new("open").primary().small().icon(IconName::ExternalLink).label("Open").tooltip("Open selected result · Return").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.open(false, window, cx))))
                 .child(Button::new("reveal").ghost().small().icon(IconName::FolderOpen).label("Show in Finder").tooltip("Reveal selected result · ⌘Return").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.open(true, window, cx))))
                 .child(Button::new("copy-path").ghost().small().icon(IconName::Copy).label("Copy path").tooltip("Copy full path · ⇧⌘C").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, _, cx| this.copy(cx))))
                 .child(div().flex_1())
                 .child(div().text_xs().text_color(cx.theme().muted_foreground).child("↑ ↓ Navigate    ↵ Open    ⌘ ↵ Reveal")))
-            .children(self.snapshot.warning.clone().map(|warning| div().id("index-warnings").test_support().role(Role::Status).aria_label(warning.clone()).max_h(px(80.)).overflow_y_scroll().px_5().pb_2().text_xs().text_color(cx.theme().muted_foreground).child(warning)))
+            .children(self.snapshot.warning.clone().map(|warning| div().id("index-warnings").test_support().role(Role::Status).aria_label(warning.clone()).max_h(px(80.)).overflow_y_scroll().px_5().pb_2().bg(cx.theme().status_bar).text_xs().text_color(cx.theme().muted_foreground).child(warning)))
     }
 }
 
