@@ -44,6 +44,21 @@ Search updates as you type. Results initially use the index’s existing path or
 | `name:README` | Match the filename |
 | `size:>10mb` | Files larger than 10 MiB |
 | `size:1kb..10kb` | Inclusive size range |
+| `modified:today` / `dm:yesterday` | Modified on that local calendar day |
+| `modified:thisweek` | Modified Monday through Sunday of this week |
+| `modified:last7days` | Modified today or during the previous six days |
+| `modified:>=2026-01-01` | Modified on or after a date |
+| `modified:2026-01-01..2026-01-31` | Inclusive range of local dates |
+
+Modified-date filters also support `>`, `<`, `<=`, and `=` with `YYYY-MM-DD` dates. A bare date matches that entire day, and `>date` starts on the following day. Files and folders without a known modified time do not match a date predicate. Relative date searches refresh when the local calendar day changes.
+
+**Saved** opens named searches. Enter a unique name and choose **Save current search** to save the query, case/path/regex/content/fuzzy modes, file-type filter, sort order, and folder scope. Select a saved name to restore it; **×** removes it. Up to 50 searches are stored locally in `saved-searches.json` beside the index, using private permissions and atomic writes. Invalid or unrecognized saved data is preserved and saving is disabled, with an error shown in the dropdown.
+
+Right-click a single folder and choose **Search here** to start a fresh search of its indexed descendants. The **Within:** chip displays its full path; **×** clears the scope while keeping the query. Scope respects configured indexed folders and exclusions, including in Content mode; it never scans an unindexed location. Similar folder prefixes such as `Archive` and `Archive2` are kept separate.
+
+Drag a result out of the window into Finder or another app to offer the actual file URLs using native macOS drag and drop. Dragging an already selected result offers the entire selection, in result order. Outbound drags offer a copy operation; the app does not remove the source files. The destination app decides how to handle a drop.
+
+**Fuzzy** optionally allows one inserted, missing, replaced, or adjacent transposed character in unquoted plain filename terms of 4–64 characters; for example, `anual report` finds `annual_report.pdf`. Shorter/longer terms, quoted phrases, wildcards, and predicates retain their exact matching rules. Fuzzy is disabled in Path, Regex, and Content modes. Existing sorting still applies; fuzzy results are not ranked by similarity. With **Aa**, case differences count as typos.
 
 The Size column and Size sorting use allocated bytes on disk, including sparse-file allocation. The `size:` search predicate uses logical file length.
 
@@ -79,7 +94,7 @@ This is a working core implementation, not full Everything feature parity:
 
 - SQLite persists the index between launches; searches still use an in-memory copy for speed. Normal folder restarts reconcile changed paths from volume history. Whole-disk trees and recovery scans can still take time and memory. There is no NTFS MFT/USN integration.
 - Only configured, accessible roots are indexed. Protected folders, offline volumes, and symlink targets can be absent. Rebuild retries watchers and rescans manually after roots are restored.
-- Bookmarks, media/date predicates, duplicate finding, thumbnails, result export, HTTP/ETP servers, Windows services, multi-window mode, and file management operations beyond copying, renaming, and moving results to Trash are not implemented.
+- Media/creation-date predicates, duplicate finding, thumbnails, result export, HTTP/ETP servers, Windows services, multi-window mode, and file management operations beyond copying, renaming, and moving results to Trash are not implemented.
 - Wildcards match the whole filename (or whole path in path mode); Unicode case folding follows Rust regex. These semantics are tested locally, not compared to a running Windows instance. Non-UTF-8 filenames display with replacement characters, although the original path is retained for opening.
 
 ## Checks
@@ -90,4 +105,4 @@ cargo check --offline
 cargo fmt --all -- --check
 ```
 
-Tests cover content-query escaping, Spotlight output decoding/cancellation/errors, content-mode controls, query parsing and matching, metadata and symlink handling, live macOS create/rename/delete notifications, database round trips, offline changes across restarts, atomic checkpoint rollback, old-format rebuilds, unknown-format rejection, quiet reopens, multiple replay roots, history-loss recovery, native bulk metadata and malformed records, cache corruption handling, settings preservation, window geometry, and the integrated search UI.
+Tests cover content-query escaping, Spotlight output decoding/cancellation/errors, content-mode controls, query parsing and matching, local modified-date boundaries, fuzzy matching, saved-search validation/persistence/restoration, folder scope, drag payloads and selection, metadata and symlink handling, live macOS create/rename/delete notifications, database round trips, offline changes across restarts, atomic checkpoint rollback, old-format rebuilds, unknown-format rejection, quiet reopens, multiple replay roots, history-loss recovery, native bulk metadata and malformed records, cache corruption handling, settings preservation, window geometry, and the integrated search UI.

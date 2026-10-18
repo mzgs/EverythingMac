@@ -56,6 +56,7 @@ impl Fixture {
                 excluded: Vec::new(),
             });
             cx.bind_keys([
+                KeyBinding::new("space", gpui_kit::NoAction, Some("Popover > Input")),
                 KeyBinding::new("down", search_view::NextResult, Some("Everything")),
                 KeyBinding::new("up", search_view::PreviousResult, Some("Everything")),
                 KeyBinding::new("cmd-f", search_view::FocusSearch, Some("Everything")),
@@ -147,6 +148,197 @@ fn type_query(window: &mut Window, cx: &mut App, query: &str) {
     window.click("search-input", cx);
     window.press("cmd-a", cx);
     window.input(query, cx);
+}
+
+#[gpui_kit::test]
+async fn date_filters_and_fuzzy_mode_work_in_the_search_ui(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let yesterday = chrono::Local::now()
+        .date_naive()
+        .pred_opt()
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap();
+    use chrono::TimeZone;
+    let yesterday = std::time::SystemTime::from(
+        chrono::Local
+            .from_local_datetime(&yesterday)
+            .earliest()
+            .unwrap(),
+    );
+    fs::File::open(fixture.root.join("beta.JPG"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(yesterday))
+        .unwrap();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    cx.update_window(handle, |_, window, cx| {
+        type_query(window, cx, "file: modified:today")
+    })
+    .unwrap();
+    wait_count(cx, handle, 3).await;
+    cx.update_window(handle, |_, window, cx| {
+        type_query(window, cx, "dm:yesterday")
+    })
+    .unwrap();
+    wait_count(cx, handle, 1).await;
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(
+            window.find(("result", 0usize)).label(),
+            fixture.root.join("beta.JPG").to_str()
+        );
+        type_query(window, cx, "alpa");
+    })
+    .unwrap();
+    wait_count(cx, handle, 0).await;
+    cx.update_window(handle, |_, window, cx| window.click("fuzzy", cx))
+        .unwrap();
+    wait_count(cx, handle, 2).await;
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(window.find("fuzzy").checked(), Some(true));
+        window.click("regex", cx);
+        window.click("fuzzy", cx);
+        assert_eq!(window.find("fuzzy").checked(), Some(true));
+    })
+    .unwrap();
+    wait_count(cx, handle, 0).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click("regex", cx);
+        type_query(window, cx, "\"alpa\"");
+    })
+    .unwrap();
+    wait_count(cx, handle, 0).await;
+}
+
+#[gpui_kit::test]
+async fn folder_scope_and_saved_searches_restore_options_after_reopening(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    // A similarly prefixed sibling must stay outside the chosen folder.
+    fs::create_dir(fixture.root.join("Archive2")).unwrap();
+    fs::write(fixture.root.join("Archive2/alpha-other.txt"), b"fixture").unwrap();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 8).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.right_click(("result", 1usize), cx)
+    })
+    .unwrap();
+    cx.wait_for(handle, Duration::from_secs(3), |window, _| {
+        window.try_find("popup-menu").is_some()
+    })
+    .await;
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(
+            window.within("popup-menu").find(9usize).label(),
+            Some("Search here")
+        );
+        window.within("popup-menu").click(9usize, cx);
+    })
+    .unwrap();
+    wait_count(cx, handle, 1).await;
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(
+            window.find("search-scope").label(),
+            Some(
+                format!(
+                    "Searching within {}",
+                    fixture.root.join("Archive").display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(window.find("search-input").value(), Some(""));
+        window.click("fuzzy", cx);
+        window.click("case", cx);
+        window.click(("filter", 6usize), cx);
+        type_query(window, cx, "alpa");
+        window.click("Modified", cx);
+        window.click("Modified", cx);
+    })
+    .unwrap();
+    wait_count(cx, handle, 1).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click("saved-searches-toggle", cx);
+        window.click("saved-search-name", cx);
+        window.input("Archived", cx);
+        window.press("space", cx);
+        assert_eq!(window.find("saved-search-name").focused(), Some(true));
+        assert_eq!(window.find("saved-search-name").value(), Some("Archived "));
+        assert_eq!(window.find("search-input").value(), Some("alpa"));
+        window.input("documents", cx);
+        window.click("save-search", cx);
+        assert!(window.try_find("saved-searches").is_none());
+        assert_eq!(window.find("search-input").focused(), Some(true));
+        window.click("clear-scope", cx);
+        assert!(window.try_find("search-scope").is_none());
+    })
+    .unwrap();
+    wait_count(cx, handle, 3).await;
+    let persisted: Vec<crate::saved_searches::SavedSearch> =
+        crate::settings::read_json(&fixture.directory.join("cache/saved-searches.json")).unwrap();
+    assert_eq!(persisted.len(), 1);
+    assert!(persisted[0].descending);
+    assert_eq!(persisted[0].sort, crate::saved_searches::Sort::Modified);
+    assert_eq!(persisted[0].filter, 6);
+    let reopened = fixture.open(cx);
+    wait_count(cx, reopened, 8).await;
+    cx.update_window(reopened, |_, window, cx| {
+        window.click("saved-searches-toggle", cx);
+        assert_eq!(
+            window.find(("saved-search", 0usize)).label(),
+            Some("Archived documents")
+        );
+        window.click(("saved-search", 0usize), cx);
+        assert!(window.try_find("saved-searches").is_none());
+        assert_eq!(window.find("search-input").value(), Some("alpa"));
+        assert_eq!(window.find("search-input").focused(), Some(true));
+        assert_eq!(window.find("fuzzy").checked(), Some(true));
+        assert_eq!(window.find("case").checked(), Some(true));
+        assert_eq!(window.find(("filter", 6usize)).checked(), Some(true));
+        assert!(window.find("search-scope").visible());
+    })
+    .unwrap();
+    wait_count(cx, reopened, 1).await;
+    cx.update_window(reopened, |_, window, cx| {
+        window.click("saved-searches-toggle", cx);
+        window.click(("remove-saved-search", 0usize), cx);
+        assert!(window.try_find(("saved-search", 0usize)).is_none());
+        window.press("escape", cx);
+    })
+    .unwrap();
+    let persisted: Vec<crate::saved_searches::SavedSearch> =
+        crate::settings::read_json(&fixture.directory.join("cache/saved-searches.json")).unwrap();
+    assert!(persisted.is_empty());
+}
+
+#[gpui_kit::test]
+async fn dragging_a_selected_row_preserves_the_selection(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click(("result", 1usize), cx);
+        window.click_with_modifiers(
+            ("result", 3usize),
+            gpui_kit::Modifiers {
+                platform: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        let from = window.find(("result", 1usize)).bounds().center();
+        window.drag(from, gpui_kit::point(px(-10.), from.y), cx);
+        assert_eq!(window.find(("result", 1usize)).selected(), Some(true));
+        assert_eq!(window.find(("result", 3usize)).selected(), Some(true));
+    })
+    .unwrap();
+    assert!(fixture.root.join("Archive/alpha-old.txt").is_file());
+    assert!(fixture.root.join("alpha.txt").is_file());
+    // A normal click still collapses a multiple selection after releasing the mouse.
+    cx.update_window(handle, |_, window, cx| {
+        window.click(("result", 3usize), cx);
+        assert_eq!(window.find(("result", 1usize)).selected(), Some(false));
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]
@@ -567,6 +759,21 @@ async fn help_text_can_be_selected_and_copied_but_not_edited(cx: &mut TestAppCon
         .unwrap();
     wait_dialog(cx, handle, true).await;
     cx.update_window(handle, |_, window, cx| {
+        let top = window.find("dialog-message").bounds().top();
+        window.scroll(
+            "dialog",
+            gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-300.))),
+            cx,
+        );
+        assert!(
+            window.find("dialog-message").bounds().top() < top,
+            "Long help text must scroll inside the dialog"
+        );
+        window.scroll(
+            "dialog",
+            gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(10000.))),
+            cx,
+        );
         let bounds = window.find("dialog-message").bounds();
         let start = bounds.origin + gpui_kit::point(px(0.1), px(10.));
         let end = gpui_kit::point(bounds.right() - px(0.1), bounds.bottom() - px(0.1));
@@ -578,6 +785,7 @@ async fn help_text_can_be_selected_and_copied_but_not_edited(cx: &mut TestAppCon
         assert!(message.contains("<cat | dog> photo"));
         assert!(message.contains("budget — both words\n\"annual report\" — exact phrase\n"));
         assert!(message.contains("extension filter\nfile: / folder: — kind\n"));
+        assert!(message.contains("modified:>=2026-10-01 — changed on or after October 1, 2026"));
         assert!(message.contains("⌘, Folders"));
         window.input("replacement", cx);
         window.drag(start, end, cx);

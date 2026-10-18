@@ -5,7 +5,7 @@ use gpui_kit::{
     component::{
         ActiveTheme, Disableable, Icon, Sizable, WindowExt,
         button::{Button, ButtonVariants},
-        dialog::{DialogAction, DialogFooter},
+        dialog::{DialogAction, DialogDescription, DialogFooter},
     },
     *,
 };
@@ -39,13 +39,15 @@ pub(crate) fn show_error(message: String, window: &mut Window, cx: &mut App) {
     window.open_alert_dialog(cx, move |dialog, _, _| {
         dialog
             .title("Everything Mac")
-            .description(div().id("dialog-message").test_support().child(
-                gpui_kit::base::SelectableText::with_handle(
-                    "dialog-text",
-                    selection.clone(),
-                    message.clone(),
-                ),
-            ))
+            .child(
+                DialogDescription::new().child(div().id("dialog-message").test_support().child(
+                    gpui_kit::base::SelectableText::with_handle(
+                        "dialog-text",
+                        selection.clone(),
+                        message.clone(),
+                    ),
+                )),
+            )
     });
 }
 

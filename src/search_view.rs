@@ -2,6 +2,7 @@ use crate::{
     content_search,
     index::{Entry, Index, Snapshot},
     query::Query,
+    saved_searches::{SavedSearch, SavedSearches, Sort},
     search_history::SearchHistory,
     settings::Settings,
 };
@@ -51,14 +52,6 @@ actions!(
     ]
 );
 
-#[derive(Clone, Copy, PartialEq)]
-enum Sort {
-    Name,
-    Path,
-    Size,
-    Modified,
-}
-
 enum SearchQuery {
     Filename(Query),
     Content(Option<String>),
@@ -79,6 +72,9 @@ pub(crate) struct SearchView {
     history_open: bool,
     history_query: SharedString,
     history_task: Option<Task<()>>,
+    saved: SavedSearches,
+    saved_open: bool,
+    saved_name: Entity<InputState>,
     results_focus: FocusHandle,
     preview: Option<crate::quick_look::Preview>,
     index: Index,
@@ -95,6 +91,9 @@ pub(crate) struct SearchView {
     path: bool,
     regex: bool,
     content: bool,
+    fuzzy: bool,
+    scope: Option<PathBuf>,
+    search_day: chrono::NaiveDate,
     filter: usize,
     filter_results: [Option<FilterResults>; 7],
     sort: Sort,
@@ -123,6 +122,7 @@ impl SearchView {
         let snapshot = index.snapshot();
         let input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search files and folders…"));
+        let saved_name = cx.new(|cx| InputState::new(window, cx).placeholder("Name this search…"));
         input.update(cx, |input, cx| input.focus(window, cx));
         let subscription =
             cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
@@ -161,6 +161,10 @@ impl SearchView {
                         }
                         let snapshot = this.index.snapshot();
                         this.update_snapshot(snapshot, window, cx);
+                        if this.search_day != chrono::Local::now().date_naive() {
+                            this.filter_results.fill_with(|| None);
+                            this.search(window, cx, false);
+                        }
                         cx.notify();
                     })
                     .is_err()
@@ -179,6 +183,13 @@ impl SearchView {
             history_open: false,
             history_query: "".into(),
             history_task: None,
+            saved: SavedSearches::load(
+                database_path
+                    .as_ref()
+                    .map(|path| path.with_file_name("saved-searches.json")),
+            ),
+            saved_open: false,
+            saved_name,
             results_focus: cx.focus_handle().tab_stop(true),
             preview: None,
             index,
@@ -195,6 +206,9 @@ impl SearchView {
             path: false,
             regex: false,
             content: false,
+            fuzzy: false,
+            scope: None,
+            search_day: chrono::Local::now().date_naive(),
             filter: 0,
             filter_results: std::array::from_fn(|_| None),
             sort: Sort::Path,
@@ -231,8 +245,212 @@ impl SearchView {
         if self.content {
             content_search::predicate(text, self.case).map(SearchQuery::Content)
         } else {
-            Query::parse(text, self.case, self.path, self.regex).map(SearchQuery::Filename)
+            Query::parse(
+                text,
+                self.case,
+                self.path,
+                self.regex,
+                self.fuzzy && !self.regex,
+            )
+            .map(SearchQuery::Filename)
         }
+    }
+
+    fn save_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.input.read(cx).value().to_string();
+        if let Err(error) = self.parse_query(&query) {
+            self.saved.error = Some(error);
+        } else if self.saved.add(SavedSearch {
+            name: self.saved_name.read(cx).value().to_string(),
+            query,
+            case: self.case,
+            path: self.path,
+            regex: self.regex,
+            content: self.content,
+            fuzzy: self.fuzzy,
+            scope: self.scope.clone(),
+            filter: self.filter,
+            sort: self.sort,
+            descending: self.descending,
+        }) {
+            self.saved_open = false;
+            self.saved_name
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.input.update(cx, |input, cx| input.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    fn recall_saved(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(saved) = self.saved.entries.get(index).cloned() else {
+            return;
+        };
+        self.case = saved.case;
+        self.path = saved.path;
+        self.regex = saved.regex;
+        self.content = saved.content;
+        self.fuzzy = saved.fuzzy;
+        self.scope = saved.scope;
+        self.filter = saved.filter;
+        self.sort = saved.sort;
+        self.descending = saved.descending;
+        self.saved_open = false;
+        self.input.update(cx, |input, cx| {
+            input.set_value(saved.query, window, cx);
+            input.focus(window, cx);
+        });
+        self.search(window, cx, true);
+    }
+
+    fn saved_searches(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Popover::new("saved-searches-popover")
+            .open(self.saved_open)
+            .on_open_change(cx.listener(|this, open, _, cx| {
+                this.saved_open = *open;
+                cx.notify();
+            }))
+            .trigger(
+                Button::new("saved-searches-toggle")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Bookmark)
+                    .accessibility_label("Saved searches")
+                    .tooltip("Save or recall a complete search"),
+            )
+            .child(
+                div()
+                    .id("saved-searches")
+                    .test_support()
+                    .w(px(360.))
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Saved searches"),
+                    )
+                    .child(
+                        Input::new(&self.saved_name)
+                            .id("saved-search-name")
+                            .aria_label("Saved search name"),
+                    )
+                    .child(
+                        Button::new("save-search")
+                            .label("Save current search")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.save_search(window, cx)),
+                            )
+                            .on_action(cx.listener(|this, _: &Confirm, window, cx| {
+                                this.save_search(window, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("saved-search-entries")
+                            .max_h(px(280.))
+                            .overflow_y_scroll()
+                            .when(self.saved.entries.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("No saved searches"),
+                                )
+                            })
+                            .children(self.saved.entries.iter().enumerate().map(
+                                |(index, saved)| {
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            Button::new(("saved-search", index))
+                                                .ghost()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .accessibility_label(saved.name.clone())
+                                                .tooltip(saved.query.clone())
+                                                .child(
+                                                    div()
+                                                        .w_full()
+                                                        .truncate()
+                                                        .child(saved.name.clone()),
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.recall_saved(index, window, cx)
+                                                    },
+                                                ))
+                                                .on_action(cx.listener(
+                                                    move |this, _: &Confirm, window, cx| {
+                                                        this.recall_saved(index, window, cx)
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new(("remove-saved-search", index))
+                                                .ghost()
+                                                .small()
+                                                .icon(IconName::X)
+                                                .accessibility_label(format!(
+                                                    "Remove saved search {}",
+                                                    saved.name
+                                                ))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.saved.remove(index);
+                                                    cx.notify();
+                                                }))
+                                                .on_action(cx.listener(
+                                                    move |this, _: &Confirm, _, cx| {
+                                                        this.saved.remove(index);
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        )
+                                },
+                            )),
+                    )
+                    .children(self.saved.error.clone().map(|error| {
+                        div()
+                            .id("saved-search-error")
+                            .test_support()
+                            .role(Role::Status)
+                            .aria_label(error.clone())
+                            .text_xs()
+                            .text_color(cx.theme().danger)
+                            .child(error)
+                    })),
+            )
+    }
+
+    fn set_scope(&mut self, scope: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        if scope.is_some() {
+            self.filter = 0;
+            self.input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.scope = scope;
+        self.input.update(cx, |input, cx| input.focus(window, cx));
+        self.search(window, cx, true);
+    }
+
+    fn drag_paths(&self, path: &std::path::Path) -> FileDragPaths {
+        let selected = self.selected_paths.contains(path);
+        FileDragPaths::new(
+            self.results
+                .iter()
+                .filter(|entry| {
+                    if selected {
+                        self.selected_paths.contains(&entry.path)
+                    } else {
+                        entry.path == path
+                    }
+                })
+                .map(|entry| (entry.path.clone(), entry.is_dir)),
+        )
     }
 
     fn recall_history(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -397,6 +615,7 @@ impl SearchView {
     }
 
     fn search(&mut self, window: &mut Window, cx: &mut Context<Self>, reveal_selection: bool) {
+        self.search_day = chrono::Local::now().date_naive();
         if reveal_selection {
             self.filter_results.fill_with(|| None);
         }
@@ -430,6 +649,7 @@ impl SearchView {
         let loaded = self.snapshot.loaded;
         let entries = self.snapshot.entries.clone();
         let roots = self.roots.clone();
+        let scope = self.scope.clone();
         let filter = self.filter;
         let sort = self.sort;
         let descending = self.descending;
@@ -468,11 +688,16 @@ impl SearchView {
                         {
                             return Ok(None);
                         }
-                        if kind_matches(entry, filter)
+                        if scope.as_ref().is_none_or(|scope| {
+                            entry.path != *scope && entry.path.starts_with(scope)
+                        }) && kind_matches(entry, filter)
                             && match &query {
-                                SearchQuery::Filename(query) => {
-                                    query.matches(&entry.path, entry.is_dir, entry.size)
-                                }
+                                SearchQuery::Filename(query) => query.matches(
+                                    &entry.path,
+                                    entry.is_dir,
+                                    entry.size,
+                                    entry.modified,
+                                ),
                                 SearchQuery::Content(_) => {
                                     !entry.is_dir && content_paths.contains(&entry.path)
                                 }
@@ -1084,19 +1309,20 @@ impl Render for SearchView {
             .on_action(cx.listener(|this, _: &NextResult, window, cx| this.move_selection(1, false, window, cx)))
             .on_action(cx.listener(|this, _: &PreviousResult, window, cx| this.move_selection(-1, false, window, cx)))
             .on_action(cx.listener(|_, _: &SearchHelp, window, cx| crate::settings_view::show_error(
-                "Search filenames as you type.\n\nreport budget — both words\n\"annual report\" — exact phrase\n*.pdf | *.docx — either pattern\n!backup — exclude a word\n<cat | dog> photo — group terms\next:jpg;png — extension filter\nfile: / folder: — kind\npath:Projects — search full path\nsize:>10mb — size filter\n\nAa: case sensitive. Path: match full paths. Regex: treat the entire query as a regular expression.\n\nContent: search text inside files using Spotlight. Type text or * / ? wildcards; the whole query is a content pattern. Aa controls case. Path, Regex and filename operators apply only to filename search. Results are limited to indexed files; Spotlight coverage and updates may lag.\n\n⌘-click Toggle selection · Shift-click Select range · ⌘A Select all · ⇧↑/↓ Extend selection · ⌘C Copy files · ⌘⌫ Move to Trash\n\n⌘F Search · ↓/↑ Select · Space Quick Look · Return Open · ⌘Return Reveal · ⇧⌘C Copy path · ⌘R Rebuild · ⌘, Folders".into(), window, cx)))
+                "Search filenames as you type.\n\nreport budget — both words\n\"annual report\" — exact phrase\n*.pdf | *.docx — either pattern\n!backup — exclude a word\n<cat | dog> photo — group terms\next:jpg;png — extension filter\nfile: / folder: — kind\npath:Projects — search full path\nsize:>10mb — size filter\nmodified:today — changed today\nmodified:thisweek — changed since Monday\nmodified:>=2026-10-01 — changed on or after October 1, 2026\nmodified:2026-01-01..2026-01-31 — inclusive dates\n\nFuzzy: allow one typo in unquoted filename terms of 4–64 characters. Quotes, wildcards and predicates stay exact.\nSaved: name and restore the query, modes, filter, folder scope and sorting. Right-click a folder → Search here; clear the scope chip to search everywhere. Drag selected files out of the window into another app.\n\nAa: case sensitive. Path: match full paths. Regex: treat the entire query as a regular expression.\n\nContent: search text inside files using Spotlight. Type text or * / ? wildcards; the whole query is a content pattern. Aa controls case. Path, Regex and filename operators apply only to filename search. Results are limited to indexed files; Spotlight coverage and updates may lag.\n\n⌘-click Toggle selection · Shift-click Select range · ⌘A Select all · ⇧↑/↓ Extend selection · ⌘C Copy files · ⌘⌫ Move to Trash\n\n⌘F Search · ↓/↑ Select · Space Quick Look · Return Open · ⌘Return Reveal · ⇧⌘C Copy path · ⌘R Rebuild · ⌘, Folders".into(), window, cx)))
             .child(div().flex().items_center().gap_2().px_5().pt_4().pb_3()
                 .child(div().flex_1().min_w_0().child(Input::new(&self.input).id("search-input").aria_label(if self.content { "Search file contents" } else { "Search files and folders" })
                 .prefix(self.search_history(window, cx))
                 .suffix(div().text_xs().text_color(cx.theme().muted_foreground).child("⌘ F"))
                 .cleanable(true)))
+                .child(self.saved_searches(cx))
                 .child(Button::new("help").ghost().icon(IconName::CircleQuestionMark).accessibility_label("Search help").tooltip("Search syntax and keyboard shortcuts").on_click(|_, window, cx| window.dispatch_action(Box::new(SearchHelp), cx))))
             .child(div().flex().flex_wrap().items_center().justify_between().px_5().pb_3().gap_2()
                 .child(div().flex().items_center().gap_1().children([
                     ("Everything", IconName::Layers), ("Files", IconName::File), ("Folders", IconName::Folder),
                     ("Audio", IconName::Music2), ("Images", IconName::Image), ("Videos", IconName::Video), ("Documents", IconName::FileText)
                 ].into_iter().enumerate().map(|(filter, (label, icon))| {
-                    Button::new(("filter", filter)).ghost().small().icon(icon).label(label).selected(self.filter == filter)
+                    Button::new(("filter", filter)).ghost().small().icon(icon).label(label).selected(self.filter == filter).toggled(self.filter == filter)
                         .when(self.filter == filter, |this| this.bg(cx.theme().selection).text_color(cx.theme().link))
                         .on_click(cx.listener(move |this, _, window, cx| this.change_filter(filter, window, cx)))
                 })))
@@ -1104,7 +1330,12 @@ impl Render for SearchView {
                     .child(Button::new("content").ghost().small().label("Content").tooltip("Search inside files using Spotlight").selected(self.content).toggled(self.content).when(self.content, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.content = !this.content; this.search(window, cx, true); })))
                     .child(Button::new("case").ghost().small().label("Aa").tooltip("Case sensitive").selected(self.case).toggled(self.case).when(self.case, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.case = !this.case; this.search(window, cx, true); })))
                     .child(Button::new("path").ghost().small().label("Path").tooltip("Search full paths (filename search only)").disabled(self.content).selected(self.path).toggled(self.path).when(self.path, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.path = !this.path; this.search(window, cx, true); })))
-                    .child(Button::new("regex").ghost().small().label("Regex").tooltip("Use a regular expression (filename search only)").disabled(self.content).selected(self.regex).toggled(self.regex).when(self.regex, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.regex = !this.regex; this.search(window, cx, true); })))))
+                    .child(Button::new("regex").ghost().small().label("Regex").tooltip("Use a regular expression (filename search only)").disabled(self.content).selected(self.regex).toggled(self.regex).when(self.regex, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.regex = !this.regex; this.search(window, cx, true); })))
+                    .child(Button::new("fuzzy").ghost().small().label("Fuzzy").tooltip("Allow one typo in plain filename terms of 4–64 characters; quotes and wildcards stay exact").disabled(self.content || self.regex || self.path).selected(self.fuzzy).toggled(self.fuzzy).when(self.fuzzy, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.fuzzy = !this.fuzzy; this.search(window, cx, true); })))))
+            .children(self.scope.clone().map(|scope| div().id("search-scope").test_support().role(Role::Status).aria_label(format!("Searching within {}", scope.display())).mx_5().mb_3().flex().items_center().gap_2().text_sm()
+                .child(Icon::new(IconName::Folder).small())
+                .child(div().flex_1().min_w_0().truncate().child(format!("Within: {}", scope.display())))
+                .child(Button::new("clear-scope").ghost().small().icon(IconName::X).accessibility_label("Clear folder scope").tooltip("Search all indexed folders").on_click(cx.listener(|this, _, window, cx| this.set_scope(None, window, cx))))))
             .when(self.content, |this| this.child(div().id("content-search-note").test_support().role(Role::Status).aria_label("Content search uses Spotlight").mx_5().mb_3().text_xs().text_color(cx.theme().muted_foreground).child("Search inside files: text or * / ? wildcards. Spotlight may omit unindexed files or recent edits.")))
             .children(self.error.clone().map(|error| div().id("search-error").test_support().role(Role::Status).aria_label(error.clone())
                 .mx_5().mb_3().px_3().py_2().rounded_md().bg(cx.theme().danger.opacity(0.08)).flex().items_center().gap_2().text_sm().text_color(cx.theme().danger)
@@ -1132,8 +1363,10 @@ impl Render for SearchView {
                         let owner = owner.clone();
                         let click_owner = owner.clone();
                         let mouse_owner = owner.clone();
+                        let drag_owner = owner.clone();
                         let action_context = action_context.clone();
                         let menu_path = entry.path.clone();
+                        let is_directory = entry.is_dir;
                         div().id(("result", i)).test_support().role(Role::Row).aria_label(entry.path.to_string_lossy().into_owned())
                             .aria_selected(selected_paths.contains(&entry.path)).flex().items_center().h_6().px_3().text_sm().w_full().cursor_pointer()
                             .when(i % 2 == 1, |row| row.bg(cx.theme().table_even))
@@ -1148,15 +1381,24 @@ impl Render for SearchView {
                             .child(div().w(px(90.)).flex_shrink_0().truncate().child(kind))
                             .child(div().w(px(110.)).flex_shrink_0().child(format_modified(entry.modified)))
                             .capture_any_mouse_down(move |event, window, cx| {
-                                let _ = mouse_owner.update(cx, |this, cx| this.select_with_modifiers(i, event.modifiers, event.button == MouseButton::Right || event.modifiers.control, window, cx));
+                                let _ = mouse_owner.update(cx, |this, cx| {
+                                    let preserve = !event.modifiers.shift && !event.modifiers.platform && this.selected_paths.len() > 1 && this.results.get(i).is_some_and(|entry| this.selected_paths.contains(&entry.path));
+                                    this.select_with_modifiers(i, event.modifiers, event.button == MouseButton::Right || event.modifiers.control || preserve, window, cx);
+                                });
                             })
                             .on_click(move |event, window, cx| {
                                 let _ = click_owner.update(cx, |this, cx| {
-                                    if !matches!(event, ClickEvent::Mouse(_)) { this.select_result(i, window, cx); }
+                                    if !matches!(event, ClickEvent::Mouse(_)) || matches!(event, ClickEvent::Mouse(event) if !event.down.modifiers.shift && !event.down.modifiers.platform && !event.down.modifiers.control) { this.select_result(i, window, cx); }
                                     if event.click_count() == 2 { this.open(false, window, cx); }
                                 });
                             })
+                            .on_drag(entry.path.clone(), |_, _, _, cx| cx.new(|_| Empty))
+                            .external_drag_payload(move |path: &PathBuf, _, cx| {
+                                drag_owner.update(cx, |this, _| ExternalDragPayload::Files(this.drag_paths(path))).ok()
+                            })
                             .context_menu(move |menu, window, cx| {
+                                // Focus before prepaint so accessibility sees only the menu as focused this frame.
+                                menu.focus_handle(cx).focus(window, cx);
                                 let dismiss_owner = owner.clone();
                                 // The menu’s temporary trigger loses its focus path when dismissed.
                                 cx.subscribe_in(&cx.entity(), window, move |_, _, _: &DismissEvent, window, cx| {
@@ -1171,6 +1413,8 @@ impl Render for SearchView {
                                 let info_path = menu_path.clone();
 
                                 let rename_path = menu_path.clone();
+                                let scope_path = menu_path.clone();
+                                let scope_owner = owner.clone();
                                 menu.action_context(action_context.clone())
                                     .menu_with_icon("Open", IconName::ExternalLink, Box::new(OpenResult))
                                     .menu_with_icon("Show in Finder", IconName::FolderOpen, Box::new(RevealResult))
@@ -1189,6 +1433,12 @@ impl Render for SearchView {
                                         }))
                                     .separator()
                                     .menu_with_icon("Move to Trash", IconName::Trash, Box::new(TrashResults))
+                                    .item(PopupMenuItem::new("Search here").icon(IconName::Search).disabled(!is_directory || multiple)
+                                        .on_click(move |_, window, cx| {
+                                            let scope_path = scope_path.clone();
+                                            let scope_owner = scope_owner.clone();
+                                            window.defer(cx, move |window, cx| { let _ = scope_owner.update(cx, |this, cx| this.set_scope(Some(scope_path), window, cx)); });
+                                        }))
                             }).into_any_element()
                     }).collect()
                 }).size_full().track_scroll(&self.scroll)
@@ -1212,6 +1462,8 @@ impl Render for SearchView {
                             this.path = false;
                             this.regex = false;
                             this.content = false;
+                            this.fuzzy = false;
+                            this.scope = None;
                             this.input.update(cx, |input, cx| { input.set_value("", window, cx); input.focus(window, cx); });
                             this.search(window, cx, true);
                         })))))))
@@ -1353,6 +1605,65 @@ mod tests {
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
     use gpui_kit::{AppContext, ScrollStrategy, TestAppContext};
     use std::{path::PathBuf, sync::Arc};
+
+    #[gpui_kit::test]
+    fn drag_payload_contains_selected_paths_and_directory_metadata(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            cx.set_global(Settings {
+                roots: Vec::new(),
+                excluded: Vec::new(),
+            })
+        });
+        let window = cx.open_window(
+            gpui_kit::size(gpui_kit::px(1050.), gpui_kit::px(450.)),
+            |window, cx| SearchView::new(None, window, cx),
+        );
+        window
+            .update(cx, |view, _, _| {
+                view.results = Arc::new(
+                    [
+                        ("/scope", true),
+                        ("/scope/a.txt", false),
+                        ("/other.txt", false),
+                    ]
+                    .into_iter()
+                    .map(|(path, is_dir)| {
+                        Arc::new(Entry {
+                            path: path.into(),
+                            is_dir,
+                            size: 0,
+                            allocated_size: 0,
+                            modified: None,
+                        })
+                    })
+                    .collect(),
+                );
+                view.selected_paths = Arc::new(
+                    [PathBuf::from("/scope"), PathBuf::from("/other.txt")]
+                        .into_iter()
+                        .collect(),
+                );
+                assert_eq!(
+                    view.drag_paths(std::path::Path::new("/scope")).entries(),
+                    &[
+                        (PathBuf::from("/scope"), true),
+                        (PathBuf::from("/other.txt"), false)
+                    ]
+                );
+                assert_eq!(
+                    view.drag_paths(std::path::Path::new("/scope/a.txt"))
+                        .entries(),
+                    &[(PathBuf::from("/scope/a.txt"), false)]
+                );
+                assert!(
+                    view.drag_paths(std::path::Path::new("/missing"))
+                        .entries()
+                        .is_empty()
+                );
+            })
+            .unwrap();
+    }
 
     #[gpui_kit::test]
     async fn startup_hides_partial_results_until_the_complete_search_finishes(

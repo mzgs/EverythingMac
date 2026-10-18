@@ -6,6 +6,7 @@ mod index;
 mod index_db;
 mod query;
 mod quick_look;
+mod saved_searches;
 mod search_history;
 mod search_view;
 mod settings;
@@ -337,6 +338,8 @@ fn main() {
         .expect("Failed to open app window");
         window_handle.set(Some(handle));
         cx.bind_keys([
+            // Text fields inside popovers must receive spaces instead of toggling the popover.
+            KeyBinding::new("space", NoAction, Some("Popover > Input")),
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-f", search_view::FocusSearch, Some("Everything")),
             KeyBinding::new("cmd-r", search_view::RebuildIndex, Some("Everything")),

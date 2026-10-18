@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+chrono = "0.4.45"
 dirs = "6"
 fsevent-sys = "4"
 libc = "0.2"

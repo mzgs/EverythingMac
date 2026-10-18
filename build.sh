@@ -16,6 +16,8 @@ mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 cp THIRD_PARTY_NOTICES.md "$bundle/Contents/Resources/ThirdPartyNotices.md"
 cp "target/release/$app_name" "$bundle/Contents/MacOS/$app_name.new"
 mv "$bundle/Contents/MacOS/$app_name.new" "$bundle/Contents/MacOS/$app_name"
+# The executable's old spelling carries an obsolete bundle signature.
+rm -f "$bundle/Contents/MacOS/eveythingmac"
 cat > "$bundle/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
