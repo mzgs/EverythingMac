@@ -8,6 +8,10 @@ A macOS filename-search app built in Rust with the project's existing GPUI Kit i
 ./run.sh
 ```
 
+For UI development without macOS folder-access prompts, use `./run.sh --preview`.
+This creates sample files and separate settings/index data in a new temporary directory.
+Preview never loads your saved indexed folders or window state; the title bar marks it **Preview**.
+
 Requires macOS, the stable Rust toolchain, and Xcode command-line tools. The first Cargo build downloads the locked dependencies. Build an ad-hoc signed app bundle with:
 
 ```sh
@@ -21,7 +25,7 @@ GPUI Fast's scroll-tile cache is disabled at startup because version 0.1.6 can o
 
 ## Search
 
-Your home folder is indexed by default. Open **Folders…** (`⌘,`) to add/remove folders or mounted volumes, then save. Nested roots are deduplicated by the indexer. Hidden files are included; symbolic links are listed without following them. Names, sizes and modified times are scanned in the background; file contents are never read by the indexer.
+Your home folder is indexed by default. Open **Indexed folders** (`⌘,`) to add/remove folders or mounted volumes, then save. Nested roots are deduplicated by the indexer. Hidden files are included; symbolic links are listed without following them. Names, sizes and modified times are scanned in the background; file contents are never read by the indexer.
 
 Search updates as you type. Results are virtualized and can be sorted by name, path, size, or modified time. Click a header again to reverse its sort. Filter by files, folders, audio, images, videos, or documents. Double-click or press Return to open the selected result with its default app; `⌘Return` reveals it in Finder and `⇧⌘C` copies its full path. `⌘F` focuses search, `↑`/`↓` select results, and `⌘R` rebuilds the index.
 

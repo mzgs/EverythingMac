@@ -3,10 +3,11 @@ use crate::{
     query::Query,
     settings::Settings,
 };
+use gpui_kit::assets::IconName;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     component::{
-        ActiveTheme, Disableable, Selectable, Sizable,
+        ActiveTheme, Disableable, Icon, Selectable, Sizable,
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState},
         scroll::Scrollbar,
@@ -309,17 +310,31 @@ impl SearchView {
         width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let suffix = if self.sort == sort {
-            if self.descending { " ↓" } else { " ↑" }
-        } else {
-            ""
-        };
         Button::new(label)
             .ghost()
             .small()
-            .label(format!("{label}{suffix}"))
+            .accessibility_label(label)
+            .tooltip(format!("Sort by {}", label.to_lowercase()))
             .w(px(width))
-            .justify_start()
+            .px_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .w_full()
+                    .child(label)
+                    .when(self.sort == sort, |this| {
+                        this.child(
+                            Icon::new(if self.descending {
+                                IconName::ArrowDown
+                            } else {
+                                IconName::ArrowUp
+                            })
+                            .xsmall(),
+                        )
+                    }),
+            )
             .on_click(cx.listener(move |this, _, window, cx| {
                 if this.sort == sort {
                     this.descending = !this.descending;
@@ -339,6 +354,51 @@ impl Render for SearchView {
         let selected = self.selected;
         let owner = cx.entity().downgrade();
         let no_results = self.results.is_empty();
+        let index_status = if self.snapshot.scanning {
+            "Updating index…"
+        } else if self.snapshot.warning.is_some() || self.snapshot.skipped > 0 {
+            "Index needs attention"
+        } else if self.roots.is_empty() {
+            "No folders indexed"
+        } else {
+            "Index up to date"
+        };
+        let displayed_status = if self.searching {
+            "Searching…"
+        } else {
+            index_status
+        };
+        let (empty_icon, empty_title, empty_description) = if self.roots.is_empty() {
+            (
+                IconName::FolderPlus,
+                "Find your files, instantly",
+                "Add a folder or volume to start. Subfolders are included.",
+            )
+        } else if self.error.is_some() {
+            (
+                IconName::CircleAlert,
+                "Let’s fix that search",
+                "Check the message above, or start with a fresh search.",
+            )
+        } else if self.snapshot.scanning {
+            (
+                IconName::HardDrive,
+                "Getting your files ready",
+                "Results appear as folders are indexed. You can keep searching.",
+            )
+        } else if self.searching {
+            (
+                IconName::Search,
+                "Searching your index…",
+                "Finding files and folders that match your search.",
+            )
+        } else {
+            (
+                IconName::SearchX,
+                "No matches found",
+                "Try fewer words, a different file type, or reset your search.",
+            )
+        };
         div().size_full().flex().flex_col().bg(cx.theme().background).text_color(cx.theme().foreground)
             .key_context("Everything")
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| this.input.update(cx, |input, cx| input.focus(window, cx))))
@@ -350,24 +410,46 @@ impl Render for SearchView {
             .on_action(cx.listener(|this, _: &PreviousResult, _, cx| this.move_selection(-1, cx)))
             .on_action(cx.listener(|_, _: &SearchHelp, window, cx| crate::settings_view::show_error(
                 "Search filenames as you type.\n\nreport budget — both words\n\"annual report\" — exact phrase\n*.pdf | *.docx — either pattern\n!backup — exclude a word\n<cat | dog> photo — group terms\next:jpg;png — extension filter\nfile: / folder: — kind\npath:Projects — search full path\nsize:>10mb — size filter\n\nAa: case sensitive. Path: match full paths. Regex: treat the entire query as a regular expression.\n\n⌘F Search · ↓/↑ Select · Return Open · ⌘Return Reveal · ⇧⌘C Copy path · ⌘R Rebuild · ⌘, Folders".into(), window, cx)))
-            .child(div().flex().items_center().justify_between().px_4().py_3()
-                .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Everything Mac"))
-                .child(div().flex().gap_2()
-                    .child(Button::new("folders").label("Folders…").on_click(|_, window, cx| window.dispatch_action(Box::new(crate::OpenSettings), cx)))
-                    .child(Button::new("rebuild").label("Rebuild").disabled(self.snapshot.scanning).on_click(cx.listener(|this, _, _, cx| { this.index.refresh(); cx.notify(); })))
-                    .child(Button::new("help").ghost().label("Search help").on_click(|_, window, cx| window.dispatch_action(Box::new(SearchHelp), cx)))))
-            .child(div().px_4().pb_3().child(Input::new(&self.input).id("search-input").large()))
-            .child(div().flex().items_center().justify_between().px_4().pb_3().gap_2()
-                .child(div().flex().gap_1().children(["Everything", "Files", "Folders", "Audio", "Images", "Videos", "Documents"].into_iter().enumerate().map(|(filter, label)| {
-                    Button::new(("filter", filter)).ghost().small().label(label).selected(self.filter == filter)
+            .child(div().flex().items_center().justify_between().px_5().pt_4().pb_3()
+                .child(div().flex().items_center().gap_3()
+                    .child(div().flex().items_center().justify_center().size_9().rounded_lg().bg(cx.theme().link.opacity(0.12))
+                        .child(Icon::new(IconName::Search).size_5().text_color(cx.theme().link)))
+                    .child(div().flex().flex_col().gap_1()
+                        .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Everything Mac"))
+                        .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Your files, a few keystrokes away."))))
+                .child(div().flex().items_center().gap_2()
+                    .child(Button::new("folders").icon(IconName::FolderCog).label("Indexed folders").tooltip("Choose folders to search · ⌘,").on_click(|_, window, cx| window.dispatch_action(Box::new(crate::OpenSettings), cx)))
+                    .child(Button::new("rebuild").ghost().icon(IconName::RefreshCw).label("Rebuild").tooltip("Rescan indexed folders · ⌘R").disabled(self.snapshot.scanning).on_click(cx.listener(|this, _, _, cx| { this.index.refresh(); cx.notify(); })))
+                    .child(Button::new("help").ghost().icon(IconName::CircleQuestionMark).accessibility_label("Search help").tooltip("Search syntax and keyboard shortcuts").on_click(|_, window, cx| window.dispatch_action(Box::new(SearchHelp), cx)))))
+            .child(div().px_5().pb_3().child(Input::new(&self.input).id("search-input").aria_label("Search files and folders").large()
+                .prefix(Icon::new(IconName::Search).small().text_color(cx.theme().muted_foreground))
+                .suffix(div().text_xs().text_color(cx.theme().muted_foreground).child("⌘ F"))
+                .cleanable(true)))
+            .child(div().flex().flex_wrap().items_center().justify_between().px_5().pb_3().gap_2()
+                .child(div().flex().items_center().gap_1().children([
+                    ("Everything", IconName::Layers), ("Files", IconName::File), ("Folders", IconName::Folder),
+                    ("Audio", IconName::Music2), ("Images", IconName::Image), ("Videos", IconName::Video), ("Documents", IconName::FileText)
+                ].into_iter().enumerate().map(|(filter, (label, icon))| {
+                    Button::new(("filter", filter)).ghost().small().icon(icon).label(label).selected(self.filter == filter)
+                        .when(self.filter == filter, |this| this.bg(cx.theme().link.opacity(0.12)).text_color(cx.theme().link))
                         .on_click(cx.listener(move |this, _, window, cx| { this.filter = filter; this.search(window, cx, true); }))
                 })))
-                .child(div().flex().gap_1()
-                    .child(Button::new("case").small().label("Aa").tooltip("Match case").selected(self.case).on_click(cx.listener(|this, _, window, cx| { this.case = !this.case; this.search(window, cx, true); })))
-                    .child(Button::new("path").small().label("Path").tooltip("Match full paths").selected(self.path).on_click(cx.listener(|this, _, window, cx| { this.path = !this.path; this.search(window, cx, true); })))
-                    .child(Button::new("regex").small().label("Regex").tooltip("Regular expression").selected(self.regex).on_click(cx.listener(|this, _, window, cx| { this.regex = !this.regex; this.search(window, cx, true); })))))
-            .children(self.error.clone().map(|error| div().px_4().py_2().text_sm().text_color(cx.theme().danger).child(error)))
-            .child(div().flex().items_center().px_4().border_y_1().border_color(cx.theme().border).bg(cx.theme().muted)
+                .child(div().flex().items_center().gap_1()
+                    .child(Button::new("case").ghost().small().label("Aa").tooltip("Case sensitive").selected(self.case).on_click(cx.listener(|this, _, window, cx| { this.case = !this.case; this.search(window, cx, true); })))
+                    .child(Button::new("path").ghost().small().label("Path").tooltip("Search full paths").selected(self.path).on_click(cx.listener(|this, _, window, cx| { this.path = !this.path; this.search(window, cx, true); })))
+                    .child(Button::new("regex").ghost().small().label("Regex").tooltip("Use a regular expression").selected(self.regex).on_click(cx.listener(|this, _, window, cx| { this.regex = !this.regex; this.search(window, cx, true); })))))
+            .children(self.error.clone().map(|error| div().id("search-error").test_support().role(Role::Status).aria_label(error.clone())
+                .mx_5().mb_3().px_3().py_2().rounded_md().bg(cx.theme().danger.opacity(0.08)).flex().items_center().gap_2().text_sm().text_color(cx.theme().danger)
+                .child(Icon::new(IconName::CircleAlert).small().flex_shrink_0()).child(div().flex_1().min_w_0().child(error))))
+            .child(div().flex().items_center().justify_between().px_5().py_2().border_t_1().border_color(cx.theme().border)
+                .child(div().flex().items_center().gap_2()
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Results"))
+                    .child(div().id("result-count").test_support().role(Role::Status).aria_label(format!("{} matches", self.results.len()))
+                        .text_xs().text_color(cx.theme().muted_foreground).child(format!("{} matches", format_count(self.results.len())))))
+                .child(div().id("index-status").test_support().role(Role::Status).aria_label(displayed_status).flex().items_center().gap_2().text_xs().text_color(cx.theme().muted_foreground)
+                    .child(Icon::new(if self.snapshot.scanning { IconName::LoaderCircle } else if self.snapshot.warning.is_some() || self.snapshot.skipped > 0 { IconName::TriangleAlert } else { IconName::HardDrive }).xsmall())
+                    .child(displayed_status)))
+            .child(div().flex().items_center().px_5().border_y_1().border_color(cx.theme().border).bg(cx.theme().muted.opacity(0.4)).text_color(cx.theme().muted_foreground)
                 .child(self.heading("Name", Sort::Name, 280., cx))
                 .child(div().flex_1().min_w_0().child(self.heading("Path", Sort::Path, 140., cx)))
                 .child(self.heading("Size", Sort::Size, 90., cx))
@@ -382,10 +464,14 @@ impl Render for SearchView {
                         let kind = if entry.is_dir { "Folder".into() } else { entry.path.extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_else(|| "File".into()) };
                         let owner = owner.clone();
                         div().id(("result", i)).test_support().role(Role::Row).aria_label(entry.path.to_string_lossy().into_owned())
-                            .aria_selected(selected == Some(i)).flex().items_center().h(px(32.)).px_4().text_sm().w_full().cursor_pointer()
-                            .when(i % 2 == 1, |row| row.bg(cx.theme().muted.opacity(0.3)))
-                            .when(selected == Some(i), |row| row.bg(cx.theme().accent))
-                            .child(div().w(px(280.)).flex_shrink_0().pr_3().truncate().child(name))
+                            .aria_selected(selected == Some(i)).flex().items_center().h(px(36.)).px_5().text_sm().w_full().cursor_pointer()
+                            .when(i % 2 == 1, |row| row.bg(cx.theme().muted.opacity(0.16)))
+                            .hover(|row| row.bg(if selected == Some(i) { cx.theme().link.opacity(0.18) } else { cx.theme().muted.opacity(0.5) }))
+                            .when(selected == Some(i), |row| row.bg(cx.theme().link.opacity(0.12)))
+                            .child(div().w(px(280.)).flex_shrink_0().pr_3().flex().items_center().gap_2()
+                                .child(Icon::new(if entry.is_dir { IconName::Folder } else { IconName::File }).small().flex_shrink_0()
+                                    .text_color(if entry.is_dir { cx.theme().link } else { cx.theme().muted_foreground }))
+                                .child(div().min_w_0().truncate().child(name)))
                             .child(div().flex_1().min_w_0().pr_3().truncate().text_color(cx.theme().muted_foreground).child(parent))
                             .child(div().w(px(90.)).flex_shrink_0().child(if entry.is_dir { "—".into() } else { format_size(entry.size) }))
                             .child(div().w(px(90.)).flex_shrink_0().truncate().child(kind))
@@ -400,16 +486,30 @@ impl Render for SearchView {
                     }).collect()
                 }).size_full().track_scroll(&self.scroll)
             ).child(Scrollbar::vertical(&self.scroll))
-                .when(no_results, |this| this.child(div().absolute().inset_0().flex().items_center().justify_center().text_color(cx.theme().muted_foreground)
-                    .child(if self.snapshot.scanning { "Building your file index…" } else if self.roots.is_empty() { "Choose folders to start searching." } else if self.error.is_some() { "Check the search expression above." } else { "No matching files or folders." }))))
-            .child(div().flex().items_center().gap_2().px_4().py_2().border_t_1().border_color(cx.theme().border)
-                .child(Button::new("open").small().label("Open").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.open(false, window, cx))))
-                .child(Button::new("reveal").small().label("Show in Finder").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.open(true, window, cx))))
-                .child(Button::new("copy-path").small().label("Copy path").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, _, cx| this.copy(cx))))
+                .when(no_results, |this| this.child(div().absolute().inset_0().flex().flex_col().gap_3().items_center().justify_center().px_5()
+                    .child(div().flex().items_center().justify_center().size_12().rounded_lg().bg(cx.theme().muted)
+                        .child(Icon::new(empty_icon).size_6().text_color(cx.theme().muted_foreground)))
+                    .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(empty_title))
+                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child(empty_description))
+                    .when(self.roots.is_empty(), |this| this.child(Button::new("empty-add-folders").primary().icon(IconName::FolderPlus).label("Add indexed folders")
+                        .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::OpenSettings), cx))))
+                    .when(!self.roots.is_empty() && !self.snapshot.scanning && !self.searching, |this| this.child(Button::new("reset-search").label("Reset search")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.filter = 0;
+                            this.case = false;
+                            this.path = false;
+                            this.regex = false;
+                            this.input.update(cx, |input, cx| { input.set_value("", window, cx); input.focus(window, cx); });
+                            this.search(window, cx, true);
+                        })))))))
+            .child(div().flex().items_center().gap_2().px_5().py_3().border_t_1().border_color(cx.theme().border)
+                .child(Button::new("open").primary().small().icon(IconName::ExternalLink).label("Open").tooltip("Open selected result · Return").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.open(false, window, cx))))
+                .child(Button::new("reveal").ghost().small().icon(IconName::FolderOpen).label("Show in Finder").tooltip("Reveal selected result · ⌘Return").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.open(true, window, cx))))
+                .child(Button::new("copy-path").ghost().small().icon(IconName::Copy).label("Copy path").tooltip("Copy full path · ⇧⌘C").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, _, cx| this.copy(cx))))
                 .child(div().flex_1())
-                .child(div().id("result-count").test_support().role(Role::Status).aria_label(format!("{} filtered · {} indexed", self.results.len(), self.snapshot.entries.len())).text_xs().text_color(cx.theme().muted_foreground).child(format!("{} filtered · {} indexed", format_count(self.results.len()), format_count(self.snapshot.entries.len())))))
-            .children(self.snapshot.warning.clone().map(|warning| div().id("index-warnings").max_h(px(80.)).overflow_y_scroll().px_4().pb_2().text_xs().text_color(cx.theme().muted_foreground).child(warning)))
-            .when(self.snapshot.skipped > 0, |this| this.child(div().px_4().pb_2().text_xs().text_color(cx.theme().muted_foreground).child(format!("{} paths could not be read. Check folder permissions or grant Full Disk Access, then rebuild.", self.snapshot.skipped))))
+                .child(div().text_xs().text_color(cx.theme().muted_foreground).child("↑ ↓ Navigate    ↵ Open    ⌘ ↵ Reveal")))
+            .children(self.snapshot.warning.clone().map(|warning| div().id("index-warnings").max_h(px(80.)).overflow_y_scroll().px_5().pb_2().text_xs().text_color(cx.theme().muted_foreground).child(warning)))
+            .when(self.snapshot.skipped > 0, |this| this.child(div().px_5().pb_2().text_xs().text_color(cx.theme().muted_foreground).child(format!("{} paths could not be read. Check folder permissions or grant Full Disk Access, then rebuild.", self.snapshot.skipped))))
     }
 }
 
@@ -669,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn formats_indexed_counts() {
+    fn formats_result_counts() {
         for (count, expected) in [
             (0, "0"),
             (999, "999"),

@@ -143,10 +143,7 @@ async fn search_filters_invalid_queries_latest_input_and_keyboard_selection(
     .unwrap();
     wait_count(cx, handle, 2).await;
     cx.update_window(handle, |_, window, cx| {
-        assert_eq!(
-            window.find("result-count").label(),
-            Some("2 filtered · 6 indexed")
-        );
+        assert_eq!(window.find("result-count").label(), Some("2 matches"));
         assert_eq!(window.find(("result", 0usize)).selected(), Some(true));
         window.press("down", cx);
         assert_eq!(window.find(("result", 1usize)).selected(), Some(true));
@@ -211,5 +208,71 @@ async fn indexed_folder_changes_cancel_or_persist_on_save(cx: &mut TestAppContex
     wait_dialog(cx, handle, false).await;
     assert!(Settings::read(&fixture.settings).unwrap().roots.is_empty());
     cx.update(|cx| assert!(cx.global::<Settings>().roots.is_empty()));
+    wait_count(cx, handle, 0).await;
+    cx.wait_for(handle, Duration::from_secs(3), |window, _| {
+        window.try_find("empty-add-folders").is_some()
+    })
+    .await;
+    cx.update_window(handle, |_, window, cx| {
+        assert!(window.try_find("empty-add-folders").is_some());
+        window.click("empty-add-folders", cx);
+    })
+    .unwrap();
+    wait_dialog(cx, handle, true).await;
+    cx.update_window(handle, |_, window, cx| {
+        assert!(
+            window
+                .within("dialog")
+                .try_find("no-indexed-folders")
+                .is_some()
+        );
+        window.within("dialog").click("cancel", cx);
+    })
+    .unwrap();
+    wait_dialog(cx, handle, false).await;
+}
+
+#[gpui_kit::test]
+async fn empty_search_can_reset_all_filters(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click(("filter", 4usize), cx);
+        window.click("case", cx);
+        window.click("path", cx);
+        window.click("regex", cx);
+        type_query(window, cx, "does-not-exist");
+    })
+    .unwrap();
+    wait_count(cx, handle, 0).await;
+    cx.wait_for(handle, Duration::from_secs(3), |window, _| {
+        window.try_find("reset-search").is_some()
+    })
+    .await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click("reset-search", cx);
+    })
+    .unwrap();
+    wait_count(cx, handle, 6).await;
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(window.find("search-input").value(), Some(""));
+        assert!(window.try_find("reset-search").is_none());
+        type_query(window, cx, "ALPHA !old");
+    })
+    .unwrap();
+    wait_count(cx, handle, 1).await;
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(
+            window.find(("result", 0usize)).label(),
+            fixture.root.join("alpha.txt").to_str()
+        );
+        type_query(
+            window,
+            cx,
+            fixture.directory.file_name().unwrap().to_str().unwrap(),
+        );
+    })
+    .unwrap();
     wait_count(cx, handle, 0).await;
 }

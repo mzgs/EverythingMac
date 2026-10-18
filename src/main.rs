@@ -15,7 +15,7 @@ use gpui_kit::*;
 use settings::Settings;
 use window_state::WindowState;
 
-use gpui_kit::assets::Assets;
+use gpui_kit::assets::AllAssets as Assets;
 
 impl Global for Settings {}
 
@@ -84,30 +84,50 @@ fn main() {
     // shortcut: gpui-fast 0.1.6 scroll tiles overflow large/HiDPI lists; remove after an upstream fix.
     // SAFETY: This runs before any application or index worker threads start.
     unsafe { std::env::set_var("GPUI_SCROLL_LAYERS", "0") };
-    let loaded = Settings::path().and_then(|path| {
-        Settings::load(&path)
-            .map(|settings| (path.clone(), settings))
-            .map_err(|error| {
-                std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
-            })
-    });
+    let preview_path = if std::env::args().any(|arg| arg == "--preview") {
+        let directory =
+            std::env::temp_dir().join(format!("everything-mac-preview-{}", std::process::id()));
+        match Settings::create_preview(&directory) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                eprintln!("Couldn’t create isolated UI preview: {error}");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let loaded = preview_path
+        .clone()
+        .map_or_else(Settings::path, Ok)
+        .and_then(|path| {
+            Settings::load(&path)
+                .map(|settings| (path.clone(), settings))
+                .map_err(|error| {
+                    std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+                })
+        });
     let (settings_path, settings, startup_error) = match loaded {
         Ok((path, settings)) => (Some(path), settings, None),
         Err(error) => (
             None,
-            Settings::default(),
+            Settings { roots: Vec::new() },
             Some(format!(
                 "Couldn’t load settings: {error}. Existing files are preserved and saving is disabled. Fix the file or folder permissions, then restart the app."
             )),
         ),
     };
-    let (window_path, restored) = match WindowState::load() {
-        Ok(loaded) => loaded,
-        Err(error) => {
-            eprintln!(
-                "Couldn’t load window geometry: {error}. Existing file is preserved; geometry saving is disabled."
-            );
-            (None, None)
+    let (window_path, restored) = if preview_path.is_some() {
+        (None, None)
+    } else {
+        match WindowState::load() {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                eprintln!(
+                    "Couldn’t load window geometry: {error}. Existing file is preserved; geometry saving is disabled."
+                );
+                (None, None)
+            }
         }
     };
     let window_handle = std::rc::Rc::new(std::cell::Cell::new(None::<AnyWindowHandle>));
@@ -141,7 +161,14 @@ fn main() {
             window_bounds: Some(WindowState::window_bounds(restored.as_ref(), cx)),
             window_min_size: Some(size(px(1050.), px(450.))),
             titlebar: Some(TitlebarOptions {
-                title: Some("Everything Mac".into()),
+                title: Some(
+                    if preview_path.is_some() {
+                        "Everything Mac — Preview"
+                    } else {
+                        "Everything Mac"
+                    }
+                    .into(),
+                ),
                 ..Default::default()
             }),
             ..Default::default()

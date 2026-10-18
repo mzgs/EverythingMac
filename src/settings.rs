@@ -22,6 +22,32 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// A separate data directory keeps development previews away from personal folders.
+    pub(crate) fn create_preview(directory: &Path) -> io::Result<PathBuf> {
+        fs::create_dir(directory)?;
+        let root = directory.join("Sample files");
+        fs::create_dir_all(root.join("Projects"))?;
+        fs::write(
+            root.join("Projects/Readme.md"),
+            "# Welcome to Everything Mac\nSearch for files, or try a file-type filter.\n",
+        )?;
+        fs::write(
+            root.join("Meeting notes.txt"),
+            "Ideas for the next release\n",
+        )?;
+        fs::write(
+            root.join("Budget.csv"),
+            "Category,Amount\nDesign,1200\nDevelopment,2400\n",
+        )?;
+        fs::write(
+            root.join("Landscape.svg"),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360"><rect width="640" height="360" fill="#dbeafe"/><path d="M0 360 220 100 420 360M280 360 470 160 640 360" fill="#60a5fa"/></svg>"##,
+        )?;
+        let path = directory.join("data/settings.json");
+        Self { roots: vec![root] }.save(&path)?;
+        Ok(path)
+    }
+
     pub(crate) fn path() -> io::Result<PathBuf> {
         let directory = dirs::data_local_dir()
             .ok_or_else(|| io::Error::other("Could not find the application data directory"))?;
@@ -119,6 +145,48 @@ pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_uses_only_its_own_sample_folder() -> io::Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("everything-preview-test-{}", std::process::id()));
+        let path = Settings::create_preview(&directory)?;
+        let result = (|| -> io::Result<()> {
+            let settings = Settings::read(&path)?;
+            assert_eq!(settings.roots, vec![directory.join("Sample files")]);
+            assert!(settings.roots[0].join("Projects/Readme.md").is_file());
+            let index = crate::index::Index::start(
+                settings.roots.clone(),
+                Some(path.with_file_name("index.sqlite3")),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let snapshot = index.snapshot();
+                if !snapshot.scanning {
+                    assert_eq!(
+                        snapshot.entries.len(),
+                        6,
+                        "Sample files must not be excluded as app data"
+                    );
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Preview index did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            index.stop();
+            assert!(
+                Settings::create_preview(&directory).is_err(),
+                "Never overwrite an existing directory"
+            );
+            assert_eq!(Settings::read(&path)?, settings);
+            Ok(())
+        })();
+        fs::remove_dir_all(directory)?;
+        result
+    }
 
     #[test]
     fn settings_persist_defaults_changes_and_preserve_invalid_files() -> io::Result<()> {
