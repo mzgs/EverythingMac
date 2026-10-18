@@ -150,6 +150,156 @@ fn type_query(window: &mut Window, cx: &mut App, query: &str) {
 }
 
 #[gpui_kit::test]
+async fn search_history_recalls_removes_persists_and_dismisses(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click("search-history-toggle", cx);
+        assert!(window.find("search-history").visible());
+        assert!(window.try_find(("search-history-query", 0usize)).is_none());
+        window.press("escape", cx);
+        assert!(window.try_find("search-history").is_none());
+        assert_eq!(window.find("search-input").focused(), Some(true));
+        type_query(window, cx, "alp");
+        type_query(window, cx, "alpha");
+    })
+    .unwrap();
+    wait_count(cx, handle, 2).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click("search-history-toggle", cx);
+        assert_eq!(
+            window.find(("search-history-query", 0usize)).label(),
+            Some("alpha")
+        );
+        assert!(window.try_find(("search-history-query", 1usize)).is_none());
+        let panel = window.find("search-history").bounds();
+        let input = window.find("search-input").bounds();
+        assert!(panel.origin.y >= input.bottom());
+        assert!(panel.right() <= input.right());
+        window.press("escape", cx);
+        type_query(window, cx, "beta");
+    })
+    .unwrap();
+    wait_count(cx, handle, 1).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click("search-history-toggle", cx);
+        assert_eq!(
+            window.find(("search-history-query", 0usize)).label(),
+            Some("beta")
+        );
+        assert_eq!(
+            window.find(("search-history-query", 1usize)).label(),
+            Some("alpha")
+        );
+        window.click(("search-history-query", 1usize), cx);
+        assert!(window.try_find("search-history").is_none());
+        assert_eq!(window.find("search-input").value(), Some("alpha"));
+        assert_eq!(window.find("search-input").focused(), Some(true));
+    })
+    .unwrap();
+    wait_count(cx, handle, 2).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click("search-history-toggle", cx);
+        assert_eq!(
+            window.find(("search-history-query", 0usize)).label(),
+            Some("alpha")
+        );
+        window.click(("search-history-remove", 0usize), cx);
+        assert_eq!(
+            window.find(("search-history-query", 0usize)).label(),
+            Some("beta")
+        );
+        assert_eq!(window.find("search-input").value(), Some("alpha"));
+        window.press("escape", cx);
+        window.click("search-history-toggle", cx);
+        assert_eq!(
+            window.find(("search-history-query", 0usize)).label(),
+            Some("beta")
+        );
+        assert!(window.try_find(("search-history-query", 1usize)).is_none());
+        window.click(("result", 0usize), cx);
+        assert!(window.try_find("search-history").is_none());
+    })
+    .unwrap();
+    let reopened = fixture.open(cx);
+    wait_count(cx, reopened, 6).await;
+    cx.update_window(reopened, |_, window, cx| {
+        window.click("search-history-toggle", cx);
+        assert_eq!(
+            window.find(("search-history-query", 0usize)).label(),
+            Some("beta")
+        );
+        window.press("tab", cx);
+        assert_eq!(
+            window.find(("search-history-query", 0usize)).focused(),
+            Some(true)
+        );
+        window.press("enter", cx);
+        assert_eq!(window.find("search-input").value(), Some("beta"));
+        assert!(window.try_find("search-history").is_none());
+    })
+    .unwrap();
+    wait_count(cx, reopened, 1).await;
+    cx.update_window(reopened, |_, window, cx| {
+        type_query(window, cx, "alpha |");
+        window.click("search-history-toggle", cx);
+        assert_eq!(
+            window.find(("search-history-query", 0usize)).label(),
+            Some("beta")
+        );
+        assert!(window.try_find(("search-history-query", 1usize)).is_none());
+        window.press("tab", cx);
+        window.press("tab", cx);
+        assert_eq!(
+            window.find(("search-history-remove", 0usize)).focused(),
+            Some(true)
+        );
+        window.press("enter", cx);
+        assert!(window.find("search-history").visible());
+        assert!(window.try_find(("search-history-query", 0usize)).is_none());
+    })
+    .unwrap();
+    let saved: Vec<String> =
+        crate::settings::read_json(&fixture.directory.join("cache/search-history.json")).unwrap();
+    assert!(saved.is_empty());
+    cx.update_window(reopened, |_, window, cx| {
+        window.press("escape", cx);
+        type_query(window, cx, &"averylongquery".repeat(12));
+        window.click("search-history-toggle", cx);
+        let panel = window.find("search-history").bounds();
+        let query = window.find(("search-history-query", 0usize)).bounds();
+        let remove = window.find(("search-history-remove", 0usize)).bounds();
+        assert!(panel.size.width <= px(480.));
+        assert!(query.right() <= remove.origin.x);
+        assert!(remove.right() <= panel.right());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+async fn search_history_saves_only_the_latest_query_after_typing_pauses(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    cx.update_window(handle, |_, window, cx| {
+        type_query(window, cx, "alp");
+        type_query(window, cx, "alpha");
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.background_executor.advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    let saved: Vec<String> =
+        crate::settings::read_json(&fixture.directory.join("cache/search-history.json")).unwrap();
+    assert_eq!(saved, ["alpha"]);
+    cx.update_window(handle, |_, window, _| {
+        assert_eq!(window.find("search-input").focused(), Some(true));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 async fn selecting_results_blurs_search_and_space_only_previews_results(cx: &mut TestAppContext) {
     use std::{cell::Cell, rc::Rc};
 

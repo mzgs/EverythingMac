@@ -47,6 +47,8 @@ Search updates as you type. Results initially use the index’s existing path or
 
 The Size column and Size sorting use allocated bytes on disk, including sparse-file allocation. The `size:` search predicate uses logical file length.
 
+Click the search icon’s dropdown to see **Search history**. Select a query to run it again, or click its **×** to remove it. Escape or clicking outside closes the dropdown. The latest 50 distinct, nonempty valid queries are saved after a one-second typing pause or when leaving search. History stores query text; the current search modes and filters still apply when recalling it. Queries are stored locally in `~/Library/Application Support/eveythingmac/search-history.json` with private file permissions. Invalid existing history is preserved and saving is disabled, with an error shown in the dropdown.
+
 **Aa** enables case-sensitive matching; **Path** searches full paths. Queries containing `/` also match full paths. **Regex** interprets the entire query as a [Rust regular expression](https://docs.rs/regex/latest/regex/), rather than Everything operators. Invalid or unsupported predicates display an error. Size units use powers of 1024.
 
 **Content** switches to optional file-content search through macOS Spotlight (`mdfind`). Type text such as `annual report`, or use `*` / `?` wildcards; the entire query is a content pattern, matched case-insensitively unless **Aa** is enabled. Filename operators such as `ext:` and `size:` are not interpreted in this mode, and **Path** / **Regex** are disabled until you switch Content off. An empty content query shows no results. The file-type filters, sorting, selection, Quick Look, and file actions still work. Reset search also turns Content off.
@@ -77,7 +79,7 @@ This is a working core implementation, not full Everything feature parity:
 
 - SQLite persists the index between launches; searches still use an in-memory copy for speed. Normal folder restarts reconcile changed paths from volume history. Whole-disk trees and recovery scans can still take time and memory. There is no NTFS MFT/USN integration.
 - Only configured, accessible roots are indexed. Protected folders, offline volumes, and symlink targets can be absent. Rebuild retries watchers and rescans manually after roots are restored.
-- Bookmarks, search history, media/date predicates, duplicate finding, thumbnails, result export, HTTP/ETP servers, Windows services, multi-window mode, and file management operations beyond copying, renaming, and moving results to Trash are not implemented.
+- Bookmarks, media/date predicates, duplicate finding, thumbnails, result export, HTTP/ETP servers, Windows services, multi-window mode, and file management operations beyond copying, renaming, and moving results to Trash are not implemented.
 - Wildcards match the whole filename (or whole path in path mode); Unicode case folding follows Rust regex. These semantics are tested locally, not compared to a running Windows instance. Non-UTF-8 filenames display with replacement characters, although the original path is retained for opening.
 
 ## Checks

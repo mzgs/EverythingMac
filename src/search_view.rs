@@ -2,9 +2,11 @@ use crate::{
     content_search,
     index::{Entry, Index, Snapshot},
     query::Query,
+    search_history::SearchHistory,
     settings::Settings,
 };
 use gpui_kit::assets::IconName;
+use gpui_kit::base::actions::Confirm;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     component::{
@@ -12,6 +14,7 @@ use gpui_kit::{
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState},
         menu::{ContextMenuExt, PopupMenuItem},
+        popover::Popover,
         progress::Progress,
         scroll::Scrollbar,
         spinner::Spinner,
@@ -72,6 +75,10 @@ struct FilterResults {
 
 pub(crate) struct SearchView {
     input: Entity<InputState>,
+    history: SearchHistory,
+    history_open: bool,
+    history_query: SharedString,
+    history_task: Option<Task<()>>,
     results_focus: FocusHandle,
     preview: Option<crate::quick_look::Preview>,
     index: Index,
@@ -119,10 +126,22 @@ impl SearchView {
         input.update(cx, |input, cx| input.focus(window, cx));
         let subscription =
             cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
-                InputEvent::Change => this.search(window, cx, true),
+                InputEvent::Change => {
+                    this.search(window, cx, true);
+                    this.history_task = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(Duration::from_secs(1)).await;
+                        let _ = this.update(cx, |this, cx| this.remember_search(cx));
+                    }));
+                }
+                InputEvent::Blur => this.remember_search(cx),
                 InputEvent::PressEnter { secondary, .. } => this.open(*secondary, window, cx),
                 _ => {}
             });
+        cx.on_app_quit(|this, cx| {
+            this.remember_search(cx);
+            async {}
+        })
+        .detach();
         let poll = cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -152,6 +171,14 @@ impl SearchView {
         });
         let mut view = Self {
             input,
+            history: SearchHistory::load(
+                database_path
+                    .as_ref()
+                    .map(|path| path.with_file_name("search-history.json")),
+            ),
+            history_open: false,
+            history_query: "".into(),
+            history_task: None,
             results_focus: cx.focus_handle().tab_stop(true),
             preview: None,
             index,
@@ -190,6 +217,170 @@ impl SearchView {
         self.snapshot.scanning
     }
 
+    fn remember_search(&mut self, cx: &mut Context<Self>) {
+        self.history_task = None;
+        let query = self.input.read(cx).value();
+        if query != self.history_query && self.parse_query(&query).is_ok() {
+            self.history.remember(&query);
+            self.history_query = query;
+            cx.notify();
+        }
+    }
+
+    fn parse_query(&self, text: &str) -> Result<SearchQuery, String> {
+        if self.content {
+            content_search::predicate(text, self.case).map(SearchQuery::Content)
+        } else {
+            Query::parse(text, self.case, self.path, self.regex).map(SearchQuery::Filename)
+        }
+    }
+
+    fn recall_history(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.history.entries[index].clone();
+        self.history_open = false;
+        self.history.remember(&query);
+        self.history_query = query.clone().into();
+        self.input.update(cx, |input, cx| {
+            input.set_value(query, window, cx);
+            input.focus(window, cx);
+        });
+        self.search(window, cx, true);
+    }
+
+    fn search_history(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        Popover::new("search-history-popover")
+            .open(self.history_open)
+            .on_open_change(cx.listener(|this, open, _, cx| {
+                if *open {
+                    this.remember_search(cx);
+                }
+                this.history_open = *open;
+                cx.notify();
+            }))
+            .trigger(
+                Button::new("search-history-toggle")
+                    .ghost()
+                    .small()
+                    .rounded_full()
+                    .accessibility_label("Search history")
+                    .tooltip("Search history")
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::new(IconName::Search).small())
+                            .child(Icon::new(IconName::ChevronDown).xsmall()),
+                    ),
+            )
+            .w((window.viewport_size().width - px(100.))
+                .max(px(160.))
+                .min(px(480.)))
+            .p_2()
+            .child(
+                div()
+                    .id("search-history")
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Search history"),
+                    )
+                    .child(
+                        div()
+                            .id("search-history-entries")
+                            .max_h(px(336.))
+                            .overflow_y_scroll()
+                            .when(self.history.entries.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .px_2()
+                                        .py_3()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("No recent searches"),
+                                )
+                            })
+                            .children(self.history.entries.iter().enumerate().map(
+                                |(index, query)| {
+                                    let query = query.clone();
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            Button::new(("search-history-query", index))
+                                                .ghost()
+                                                .w_full()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .accessibility_label(query.clone())
+                                                .tooltip(query.clone())
+                                                .child(
+                                                    div()
+                                                        .w_full()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .font_family(
+                                                            cx.theme().mono_font_family.clone(),
+                                                        )
+                                                        .child(query.clone()),
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.recall_history(index, window, cx)
+                                                    },
+                                                ))
+                                                .on_action(cx.listener(
+                                                    move |this, _: &Confirm, window, cx| {
+                                                        this.recall_history(index, window, cx)
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new(("search-history-remove", index))
+                                                .ghost()
+                                                .small()
+                                                .icon(IconName::X)
+                                                .accessibility_label(format!(
+                                                    "Remove {} from search history",
+                                                    self.history.entries[index]
+                                                ))
+                                                .tooltip("Remove from history")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.history.remove(index);
+                                                    cx.notify();
+                                                }))
+                                                .on_action(cx.listener(
+                                                    move |this, _: &Confirm, _, cx| {
+                                                        this.history.remove(index);
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        )
+                                },
+                            )),
+                    )
+                    .children(self.history.error.clone().map(|error| {
+                        div()
+                            .id("search-history-error")
+                            .test_support()
+                            .role(Role::Status)
+                            .aria_label(error.clone())
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .text_color(cx.theme().danger)
+                            .child(error)
+                    })),
+            )
+    }
+
     pub(crate) fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.index.refresh();
         cx.notify();
@@ -219,12 +410,7 @@ impl SearchView {
             return;
         }
         let text = self.input.read(cx).value();
-        let query = if self.content {
-            content_search::predicate(&text, self.case).map(SearchQuery::Content)
-        } else {
-            Query::parse(&text, self.case, self.path, self.regex).map(SearchQuery::Filename)
-        };
-        let query = match query {
+        let query = match self.parse_query(&text) {
             Ok(query) => query,
             Err(error) => {
                 self.starting = false;
@@ -484,6 +670,7 @@ impl SearchView {
     }
 
     fn open(&mut self, reveal: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.remember_search(cx);
         if self.searching {
             self.pending_open = Some(reveal);
             return;
@@ -760,7 +947,7 @@ impl Drop for SearchView {
 }
 
 impl Render for SearchView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let startup_loading = self.starting.then(|| {
             let stage = if !self.snapshot.loaded {
                 "Loading files and folders…"
@@ -900,7 +1087,7 @@ impl Render for SearchView {
                 "Search filenames as you type.\n\nreport budget — both words\n\"annual report\" — exact phrase\n*.pdf | *.docx — either pattern\n!backup — exclude a word\n<cat | dog> photo — group terms\next:jpg;png — extension filter\nfile: / folder: — kind\npath:Projects — search full path\nsize:>10mb — size filter\n\nAa: case sensitive. Path: match full paths. Regex: treat the entire query as a regular expression.\n\nContent: search text inside files using Spotlight. Type text or * / ? wildcards; the whole query is a content pattern. Aa controls case. Path, Regex and filename operators apply only to filename search. Results are limited to indexed files; Spotlight coverage and updates may lag.\n\n⌘-click Toggle selection · Shift-click Select range · ⌘A Select all · ⇧↑/↓ Extend selection · ⌘C Copy files · ⌘⌫ Move to Trash\n\n⌘F Search · ↓/↑ Select · Space Quick Look · Return Open · ⌘Return Reveal · ⇧⌘C Copy path · ⌘R Rebuild · ⌘, Folders".into(), window, cx)))
             .child(div().flex().items_center().gap_2().px_5().pt_4().pb_3()
                 .child(div().flex_1().min_w_0().child(Input::new(&self.input).id("search-input").aria_label(if self.content { "Search file contents" } else { "Search files and folders" })
-                .prefix(Icon::new(IconName::Search).small().text_color(cx.theme().muted_foreground))
+                .prefix(self.search_history(window, cx))
                 .suffix(div().text_xs().text_color(cx.theme().muted_foreground).child("⌘ F"))
                 .cleanable(true)))
                 .child(Button::new("help").ghost().icon(IconName::CircleQuestionMark).accessibility_label("Search help").tooltip("Search syntax and keyboard shortcuts").on_click(|_, window, cx| window.dispatch_action(Box::new(SearchHelp), cx))))

@@ -6,6 +6,7 @@ mod index;
 mod index_db;
 mod query;
 mod quick_look;
+mod search_history;
 mod search_view;
 mod settings;
 mod settings_view;
