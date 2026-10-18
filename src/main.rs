@@ -1,5 +1,13 @@
+mod bulk;
+mod fs_events;
+mod index;
+mod index_db;
+mod query;
+mod search_view;
 mod settings;
 mod settings_view;
+#[cfg(test)]
+mod ui_tests;
 mod window_state;
 
 use gpui_kit::component::{ActiveTheme, Theme};
@@ -7,32 +15,14 @@ use gpui_kit::*;
 use settings::Settings;
 use window_state::WindowState;
 
-gpui_kit::assets::icon_assets!(SettingsIcons, [Upload, Download]);
-
-struct Assets;
-
-impl AssetSource for Assets {
-    fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        if let Some(bytes) = SettingsIcons.load(path)? {
-            return Ok(Some(bytes));
-        }
-        gpui_kit::assets::Assets.load(path)
-    }
-
-    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        let mut paths = gpui_kit::assets::Assets.list(path)?;
-        paths.extend(SettingsIcons.list(path)?);
-        paths.sort();
-        paths.dedup();
-        Ok(paths)
-    }
-}
+use gpui_kit::assets::Assets;
 
 impl Global for Settings {}
 
 actions!(base_app, [Quit, OpenSettings]);
 
 struct AppView {
+    search: Entity<search_view::SearchView>,
     window_path: Option<std::path::PathBuf>,
     window_state: WindowState,
 }
@@ -41,6 +31,7 @@ impl AppView {
     fn new(
         window_path: Option<std::path::PathBuf>,
         restored: Option<WindowState>,
+        database_path: Option<std::path::PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -62,6 +53,7 @@ impl AppView {
             true
         });
         Self {
+            search: cx.new(|cx| search_view::SearchView::new(database_path, window, cx)),
             window_path,
             window_state,
         }
@@ -81,11 +73,17 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().bg(cx.theme().background)
+        div()
+            .size_full()
+            .bg(cx.theme().background)
+            .child(self.search.clone())
     }
 }
 
 fn main() {
+    // shortcut: gpui-fast 0.1.6 scroll tiles overflow large/HiDPI lists; remove after an upstream fix.
+    // SAFETY: This runs before any application or index worker threads start.
+    unsafe { std::env::set_var("GPUI_SCROLL_LAYERS", "0") };
     let loaded = Settings::path().and_then(|path| {
         Settings::load(&path)
             .map(|settings| (path.clone(), settings))
@@ -141,12 +139,16 @@ fn main() {
 
         let options = WindowOptions {
             window_bounds: Some(WindowState::window_bounds(restored.as_ref(), cx)),
+            window_min_size: Some(size(px(1050.), px(450.))),
             titlebar: Some(TitlebarOptions {
-                title: Some(env!("CARGO_PKG_NAME").into()),
+                title: Some("Everything Mac".into()),
                 ..Default::default()
             }),
             ..Default::default()
         };
+        let database_path = settings_path
+            .as_ref()
+            .map(|path| path.with_file_name("index.sqlite3"));
         let (handle, _) = gpui_kit::open_window(options, cx, |window, cx| {
             Theme::sync_system_appearance(Some(window), cx);
             window
@@ -154,12 +156,19 @@ fn main() {
                     Theme::sync_system_appearance(Some(window), cx);
                 })
                 .detach();
-            cx.new(|cx| AppView::new(window_path, restored, window, cx))
+            cx.new(|cx| AppView::new(window_path, restored, database_path, window, cx))
         })
         .expect("Failed to open app window");
         window_handle.set(Some(handle));
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-f", search_view::FocusSearch, Some("Everything")),
+            KeyBinding::new("cmd-r", search_view::RebuildIndex, Some("Everything")),
+            KeyBinding::new("cmd-enter", search_view::RevealResult, Some("Everything")),
+            KeyBinding::new("shift-cmd-c", search_view::CopyPath, Some("Everything")),
+            KeyBinding::new("down", search_view::NextResult, Some("Everything")),
+            KeyBinding::new("up", search_view::PreviousResult, Some("Everything")),
+            KeyBinding::new("enter", search_view::OpenResult, Some("Everything")),
             KeyBinding::new("cmd-,", OpenSettings, None),
             #[cfg(not(target_os = "macos"))]
             KeyBinding::new("ctrl-q", Quit, None),
@@ -169,10 +178,11 @@ fn main() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         settings_view::register_action(handle, settings_path, startup_error.clone(), cx);
         cx.set_menus(vec![Menu {
-            name: env!("CARGO_PKG_NAME").into(),
+            name: "Everything Mac".into(),
             disabled: false,
             items: vec![
-                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::action("Indexed folders…", OpenSettings),
+                MenuItem::action("Search help", search_view::SearchHelp),
                 MenuItem::separator(),
                 MenuItem::action("Quit", Quit),
             ],

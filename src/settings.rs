@@ -10,18 +10,13 @@ const MAX_SETTINGS_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Settings {
-    // Replace these examples with your app's settings.
-    pub(crate) display_name: String,
-    pub(crate) notifications_enabled: bool,
-    pub(crate) recent_items_limit: u32,
+    pub(crate) roots: Vec<PathBuf>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            display_name: "Guest".into(),
-            notifications_enabled: true,
-            recent_items_limit: 10,
+            roots: dirs::home_dir().into_iter().collect(),
         }
     }
 }
@@ -46,10 +41,23 @@ impl Settings {
     }
 
     pub(crate) fn read(path: &Path) -> io::Result<Self> {
-        read_json(path)
+        let settings: Self = read_json(path)?;
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        if self.roots.len() > 64 || self.roots.iter().any(|path| !path.is_absolute()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Use at most 64 absolute folder paths",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn save(&self, path: &Path) -> io::Result<()> {
+        self.validate()?;
         write_json(path, self)
     }
 }
@@ -128,20 +136,16 @@ mod tests {
             let missing = directory.join("missing.json");
             assert!(Settings::read(&missing).is_err());
             assert!(!missing.exists());
-            settings.display_name = "Ada".into();
-            settings.notifications_enabled = false;
-            settings.recent_items_limit = 3;
+            settings.roots = vec![directory.clone()];
             settings.save(&path)?;
             assert_eq!(Settings::load(&path)?, settings);
-            fs::write(&path, r#"{"display_name":"Lin"}"#)?;
-            assert_eq!(
-                Settings::load(&path)?,
-                Settings {
-                    display_name: "Lin".into(),
-                    ..Settings::default()
-                }
-            );
-            for invalid in ["invalid JSON", r#"{"recent_items_limit":-1}"#] {
+            fs::write(&path, "{}")?;
+            assert_eq!(Settings::load(&path)?, Settings::default());
+            for invalid in [
+                "invalid JSON",
+                r#"{"roots":["relative"]}"#,
+                r#"{"roots":-1}"#,
+            ] {
                 fs::write(&path, invalid)?;
                 assert!(Settings::load(&path).is_err());
                 assert_eq!(fs::read_to_string(&path)?, invalid);
@@ -153,15 +157,14 @@ mod tests {
                 io::ErrorKind::InvalidData
             );
             let huge = Settings {
-                display_name: "x".repeat(MAX_SETTINGS_BYTES),
-                ..Settings::default()
+                roots: vec![PathBuf::from("x".repeat(MAX_SETTINGS_BYTES))],
             };
             assert!(huge.save(&path).is_err());
-            assert_eq!(fs::read_to_string(&path)?, r#"{"recent_items_limit":-1}"#);
+            assert_eq!(fs::read_to_string(&path)?, r#"{"roots":-1}"#);
             let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
             fs::write(&temporary, "existing temporary file")?;
             assert!(settings.save(&path).is_err());
-            assert_eq!(fs::read_to_string(&path)?, r#"{"recent_items_limit":-1}"#);
+            assert_eq!(fs::read_to_string(&path)?, r#"{"roots":-1}"#);
             assert_eq!(fs::read_to_string(&temporary)?, "existing temporary file");
             assert!(
                 Settings::path()?
