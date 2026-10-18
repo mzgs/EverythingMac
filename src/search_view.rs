@@ -327,7 +327,8 @@ impl SearchView {
                     this.sort = sort;
                     this.descending = false;
                 }
-                this.search(window, cx, true);
+                this.scroll.scroll_to_item(0, ScrollStrategy::Top);
+                this.search(window, cx, false);
             }))
     }
 }
@@ -498,18 +499,22 @@ mod tests {
     use std::{path::PathBuf, sync::Arc};
 
     #[gpui_kit::test]
-    async fn background_refresh_preserves_scroll_position(cx: &mut TestAppContext) {
+    async fn background_refresh_preserves_scroll_and_sorting_goes_to_top(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         cx.update(|cx| {
             cx.set_reduce_motion(true);
             cx.set_global(Settings { roots: Vec::new() });
         });
-        let window = cx.add_window(|window, cx| {
-            window.set_scroll_layers(false);
-            SearchView::new(None, window, cx)
-        });
+        let window = cx.open_window(
+            gpui_kit::size(gpui_kit::px(1150.), gpui_kit::px(800.)),
+            |window, cx| {
+                window.set_scroll_layers(false);
+                SearchView::new(None, window, cx)
+            },
+        );
         let task = window
             .update(cx, |view, window, cx| {
+                view._poll = gpui_kit::Task::ready(());
                 view.snapshot.entries = Arc::new(
                     (0..500)
                         .map(|i| {
@@ -557,6 +562,51 @@ mod tests {
                 assert_eq!(view.scroll.0.borrow().base_handle.offset(), offset);
             })
             .unwrap();
+        for heading in [
+            "Name", "Name", "Size", "Size", "Modified", "Modified", "Path", "Path",
+        ] {
+            window
+                .update(cx, |view, _, cx| {
+                    view.scroll.scroll_to_item(200, ScrollStrategy::Top);
+                    cx.notify();
+                })
+                .unwrap();
+            cx.update_window(window.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.click(heading, cx);
+            })
+            .unwrap();
+            let task = window
+                .update(cx, |view, _, _| view.search_task.take().unwrap())
+                .unwrap();
+            task.await;
+            cx.update_window(window.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.try_find(("result", 0usize)).is_some(), "{heading}");
+                assert!(window.try_find(("result", 200usize)).is_none(), "{heading}");
+            })
+            .unwrap();
+            window
+                .update(cx, |view, _, _| {
+                    assert_eq!(
+                        view.scroll.0.borrow().base_handle.offset().y,
+                        gpui_kit::px(0.)
+                    );
+                    assert_eq!(
+                        view.results[view.selected.unwrap()].path,
+                        PathBuf::from("/fixture/file-000.txt")
+                    );
+                    assert_eq!(
+                        view.results[0].path,
+                        PathBuf::from(if view.descending {
+                            "/fixture/file-499.txt"
+                        } else {
+                            "/fixture/file-000.txt"
+                        })
+                    );
+                })
+                .unwrap();
+        }
         let task = window
             .update(cx, |view, window, cx| {
                 view.search(window, cx, true);
@@ -564,9 +614,12 @@ mod tests {
             })
             .unwrap();
         task.await;
+        let selected = window
+            .update(cx, |view, _, _| view.selected.unwrap())
+            .unwrap();
         cx.update_window(window.into(), |_, window, cx| {
             window.render_frame(cx);
-            assert!(window.try_find(("result", 0usize)).is_some());
+            assert!(window.try_find(("result", selected)).is_some());
             assert!(window.try_find(("result", 200usize)).is_none());
         })
         .unwrap();
