@@ -87,9 +87,45 @@ fn init_theme(cx: &mut App) {
         std::rc::Rc::make_mut(&mut theme.light_theme)
             .colors
             .selection = Some("#007aff33".into());
-        std::rc::Rc::make_mut(&mut theme.dark_theme)
-            .colors
-            .selection = Some("#0a84ff4d".into());
+        let colors = &mut std::rc::Rc::make_mut(&mut theme.dark_theme).colors;
+        colors.background = Some("#1c1e22".into());
+        colors.foreground = Some("#e6e9ee".into());
+        colors.title_bar = Some("#30343b".into());
+        colors.title_bar_border = Some("#3d424a".into());
+        colors.status_bar = Some("#24262b".into());
+        colors.status_bar_border = Some("#3d424a".into());
+        colors.border = Some("#3d424a".into());
+        colors.input = Some("#626975".into());
+        colors.muted = Some("#292c32".into());
+        colors.muted_foreground = Some("#adb4bf".into());
+        colors.accent = Some("#343941".into());
+        colors.accent_foreground = Some("#e6e9ee".into());
+        colors.primary = Some("#8bbcff".into());
+        colors.primary_hover = Some("#a5ccff".into());
+        colors.primary_active = Some("#73a9ed".into());
+        colors.primary_foreground = Some("#172334".into());
+        colors.secondary = Some("#343941".into());
+        colors.secondary_hover = Some("#404650".into());
+        colors.secondary_active = Some("#292c32".into());
+        colors.secondary_foreground = Some("#e6e9ee".into());
+        colors.link = Some("#8bbcff".into());
+        colors.link_hover = Some("#a5ccff".into());
+        colors.link_active = Some("#73a9ed".into());
+        colors.ring = Some("#8bbcff".into());
+        colors.selection = Some("#3979d14d".into());
+        colors.table = Some("#1c1e22".into());
+        colors.table_even = Some("#202328".into());
+        colors.table_hover = Some("#2c3037".into());
+        colors.table_active = Some("#4f91e933".into());
+        colors.table_active_border = Some("#8bbcff".into());
+        colors.table_head = Some("#292c32".into());
+        colors.table_head_foreground = Some("#adb4bf".into());
+        colors.table_row_border = Some("#3d424a".into());
+        colors.popover = Some("#292c32".into());
+        colors.popover_foreground = Some("#e6e9ee".into());
+        colors.group_box = Some("#24262b".into());
+        colors.group_box_foreground = Some("#e6e9ee".into());
+        colors.progress_bar = Some("#8bbcff".into());
     });
     Theme::change(cx.theme().mode, None, cx);
 }
