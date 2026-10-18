@@ -13,6 +13,7 @@ use gpui_kit::{
         menu::{ContextMenuExt, PopupMenuItem},
         progress::Progress,
         scroll::Scrollbar,
+        spinner::Spinner,
     },
     *,
 };
@@ -48,6 +49,13 @@ enum Sort {
     Modified,
 }
 
+struct FilterResults {
+    results: Arc<Vec<Arc<Entry>>>,
+    selected: Option<usize>,
+    sort: Sort,
+    descending: bool,
+}
+
 pub(crate) struct SearchView {
     input: Entity<InputState>,
     results_focus: FocusHandle,
@@ -63,9 +71,11 @@ pub(crate) struct SearchView {
     path: bool,
     regex: bool,
     filter: usize,
+    filter_results: [Option<FilterResults>; 7],
     sort: Sort,
     descending: bool,
     searching: bool,
+    sorting: bool,
     starting: bool,
     pending_open: Option<bool>,
     error: Option<String>,
@@ -73,7 +83,6 @@ pub(crate) struct SearchView {
     _subscription: Subscription,
     _poll: Task<()>,
     search_task: Option<Task<()>>,
-    pending_search: Option<bool>,
 }
 
 impl SearchView {
@@ -135,9 +144,11 @@ impl SearchView {
             path: false,
             regex: false,
             filter: 0,
+            filter_results: std::array::from_fn(|_| None),
             sort: Sort::Path,
             descending: false,
             searching: false,
+            sorting: false,
             starting,
             pending_open: None,
             error: None,
@@ -145,7 +156,6 @@ impl SearchView {
             _subscription: subscription,
             _poll: poll,
             search_task: None,
-            pending_search: None,
         };
         view.search(window, cx, true);
         view
@@ -162,6 +172,7 @@ impl SearchView {
 
     fn update_snapshot(&mut self, snapshot: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
         if snapshot.revision != self.snapshot.revision {
+            self.filter_results.fill_with(|| None);
             self.snapshot = snapshot;
             if self.search_task.is_none() {
                 self.search(window, cx, false);
@@ -170,10 +181,14 @@ impl SearchView {
     }
 
     fn search(&mut self, window: &mut Window, cx: &mut Context<Self>, reveal_selection: bool) {
+        if reveal_selection {
+            self.filter_results.fill_with(|| None);
+        }
         self.pending_open = None;
+        self.search_task = None;
+        self.sorting = false;
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         if self.starting && !self.snapshot.loaded {
-            self.pending_search = self.search_task.as_ref().map(|_| reveal_selection);
             self.searching = false;
             cx.notify();
             return;
@@ -188,7 +203,6 @@ impl SearchView {
             Ok(query) => query,
             Err(error) => {
                 self.starting = false;
-                self.pending_search = None;
                 self.error = Some(error);
                 self.results = Arc::new(Vec::new());
                 self.selected = None;
@@ -199,11 +213,6 @@ impl SearchView {
         };
         self.error = None;
         self.searching = true;
-        if self.search_task.is_some() {
-            self.pending_search = Some(reveal_selection);
-            cx.notify();
-            return;
-        }
         let revision = self.snapshot.revision;
         let loaded = self.snapshot.loaded;
         let entries = self.snapshot.entries.clone();
@@ -211,22 +220,23 @@ impl SearchView {
         let sort = self.sort;
         let descending = self.descending;
         let current = self.generation.clone();
-        let selected_path = self
-            .selected
-            .and_then(|i| self.results.get(i))
-            .map(|e| e.path.clone());
         self.search_task = Some(cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(80))
-                .await;
+            if reveal_selection {
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+            }
+            let matching_generation = current.clone();
             let result = cx
                 .background_spawn(async move {
-                    if current.load(Ordering::Relaxed) != generation {
+                    if matching_generation.load(Ordering::Relaxed) != generation {
                         return None;
                     }
                     let mut results = Vec::new();
                     for (i, entry) in entries.iter().enumerate() {
-                        if i % 1024 == 0 && current.load(Ordering::Relaxed) != generation {
+                        if i % 1024 == 0
+                            && matching_generation.load(Ordering::Relaxed) != generation
+                        {
                             return None;
                         }
                         if kind_matches(entry, filter)
@@ -235,70 +245,143 @@ impl SearchView {
                             results.push(entry.clone());
                         }
                     }
-                    match sort {
-                        // Stable sorting keeps equal names in the snapshot's path order.
-                        Sort::Name => results.sort_by_cached_key(|e| {
-                            e.path
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_lowercase()
-                        }),
-                        // Snapshots arrive in path order; filtering preserves it.
-                        Sort::Path => {}
-                        Sort::Size => results.sort_by(|a, b| {
-                            a.allocated_size
-                                .cmp(&b.allocated_size)
-                                .then_with(|| a.path.cmp(&b.path))
-                        }),
-                        Sort::Modified => results.sort_by(|a, b| {
-                            a.modified
-                                .cmp(&b.modified)
-                                .then_with(|| a.path.cmp(&b.path))
-                        }),
-                    }
-                    if descending {
-                        results.reverse();
-                    }
-                    if current.load(Ordering::Relaxed) != generation {
-                        return None;
-                    }
                     Some(Arc::new(results))
                 })
                 .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.search_task = None;
-                if this.generation.load(Ordering::Relaxed) != generation {
-                    if let Some(reveal_selection) = this.pending_search.take() {
-                        let pending_open = this.pending_open;
-                        this.search(window, cx, reveal_selection);
-                        this.pending_open = pending_open;
+            let Some(mut results) = result else { return };
+            if (sort != Sort::Path || descending) && results.len() > 1 {
+                let published = this.update_in(cx, |this, _, cx| {
+                    if this.generation.load(Ordering::Relaxed) != generation {
+                        return false;
                     }
-                    return;
-                }
-                if let Some(results) = result {
-                    this.selected = selected_path
-                        .and_then(|path| results.iter().position(|entry| entry.path == path))
-                        .or_else(|| (!results.is_empty()).then_some(0));
-                    this.results = results;
                     this.searching = false;
-                    if this.starting && loaded {
+                    this.sorting = true;
+                    if loaded {
                         this.starting = false;
                     }
-                    if reveal_selection {
-                        this.scroll
-                            .scroll_to_item(this.selected.unwrap_or(0), ScrollStrategy::Top);
-                    }
-                    if let Some(reveal) = this.pending_open.take() {
-                        this.open(reveal, window, cx);
-                    }
-                    cx.notify();
-                    if this.snapshot.revision != revision {
-                        this.search(window, cx, false);
-                    }
+                    this.set_results(results.clone(), cx, reveal_selection);
+                    true
+                });
+                if !matches!(published, Ok(true)) {
+                    return;
+                }
+                let sorted = cx
+                    .background_spawn(async move {
+                        if current.load(Ordering::Relaxed) != generation {
+                            return None;
+                        }
+                        let mut results = Arc::unwrap_or_clone(results);
+                        // shortcut: an active standard sort finishes on its worker; chunk it if rapid requests cause contention.
+                        match sort {
+                            // Stable sorting keeps equal names in the snapshot's path order.
+                            Sort::Name => results.sort_by_cached_key(|e| {
+                                e.path
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_lowercase()
+                            }),
+                            // Snapshots arrive in path order; filtering preserves it.
+                            Sort::Path => {}
+                            Sort::Size => results.sort_by(|a, b| {
+                                a.allocated_size
+                                    .cmp(&b.allocated_size)
+                                    .then_with(|| a.path.cmp(&b.path))
+                            }),
+                            Sort::Modified => results.sort_by(|a, b| {
+                                a.modified
+                                    .cmp(&b.modified)
+                                    .then_with(|| a.path.cmp(&b.path))
+                            }),
+                        }
+                        if descending {
+                            results.reverse();
+                        }
+                        if current.load(Ordering::Relaxed) != generation {
+                            return None;
+                        }
+                        Some(Arc::new(results))
+                    })
+                    .await;
+                let Some(sorted) = sorted else { return };
+                results = sorted;
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.generation.load(Ordering::Relaxed) != generation {
+                    return;
+                }
+                this.search_task = None;
+                this.searching = false;
+                this.sorting = false;
+                this.set_results(results, cx, reveal_selection);
+                if this.starting && loaded {
+                    this.starting = false;
+                }
+                if let Some(reveal) = this.pending_open.take() {
+                    this.open(reveal, window, cx);
+                }
+                if this.snapshot.revision == revision {
+                    this.filter_results[filter] = Some(FilterResults {
+                        results: this.results.clone(),
+                        selected: this.selected,
+                        sort,
+                        descending,
+                    });
+                } else {
+                    this.search(window, cx, false);
                 }
             });
         }));
+        cx.notify();
+    }
+
+    fn change_filter(&mut self, filter: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.filter == filter {
+            return;
+        }
+        if !self.searching
+            && !self.sorting
+            && let Some(saved) = &mut self.filter_results[self.filter]
+        {
+            saved.selected = self.selected;
+        }
+        self.filter = filter;
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        if let Some(saved) = &self.filter_results[filter] {
+            self.generation.fetch_add(1, Ordering::Relaxed);
+            self.search_task = None;
+            self.pending_open = None;
+            self.searching = false;
+            self.sorting = false;
+            self.error = None;
+            self.results = saved.results.clone();
+            self.selected = saved.selected;
+            self.sort = saved.sort;
+            self.descending = saved.descending;
+            cx.notify();
+        } else {
+            self.sort = Sort::Path;
+            self.descending = false;
+            self.search(window, cx, false);
+        }
+    }
+
+    fn set_results(
+        &mut self,
+        results: Arc<Vec<Arc<Entry>>>,
+        cx: &mut Context<Self>,
+        reveal_selection: bool,
+    ) {
+        self.selected = self
+            .selected
+            .and_then(|i| self.results.get(i))
+            .and_then(|entry| results.iter().position(|result| result.path == entry.path))
+            .or_else(|| (!results.is_empty()).then_some(0));
+        self.results = results;
+        if reveal_selection {
+            self.scroll
+                .scroll_to_item(self.selected.unwrap_or(0), ScrollStrategy::Top);
+        }
         cx.notify();
     }
 
@@ -435,14 +518,17 @@ impl SearchView {
                     .w_full()
                     .child(label)
                     .when(self.sort == sort, |this| {
-                        this.child(
+                        this.child(if self.sorting {
+                            Spinner::new().xsmall().into_any_element()
+                        } else {
                             Icon::new(if self.descending {
                                 IconName::ArrowDown
                             } else {
                                 IconName::ArrowUp
                             })
-                            .xsmall(),
-                        )
+                            .xsmall()
+                            .into_any_element()
+                        })
                     }),
             )
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -600,7 +686,7 @@ impl Render for SearchView {
                 ].into_iter().enumerate().map(|(filter, (label, icon))| {
                     Button::new(("filter", filter)).ghost().small().icon(icon).label(label).selected(self.filter == filter)
                         .when(self.filter == filter, |this| this.bg(cx.theme().selection).text_color(cx.theme().link))
-                        .on_click(cx.listener(move |this, _, window, cx| { this.filter = filter; this.search(window, cx, true); }))
+                        .on_click(cx.listener(move |this, _, window, cx| this.change_filter(filter, window, cx)))
                 })))
                 .child(div().flex().items_center().gap_1()
                     .child(Button::new("case").ghost().small().label("Aa").tooltip("Case sensitive").selected(self.case).when(self.case, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.case = !this.case; this.search(window, cx, true); })))
@@ -962,7 +1048,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    async fn live_updates_finish_search_before_refreshing_and_queue_the_latest_query(
+    async fn live_updates_finish_search_before_refreshing_and_use_the_latest_query(
         cx: &mut TestAppContext,
     ) {
         cx.update(gpui_kit::init);
@@ -1032,13 +1118,6 @@ mod tests {
             window.input("missing", cx);
         })
         .unwrap();
-        let refresh = window
-            .update(cx, |view, _, _| {
-                assert!(view.pending_search.is_some());
-                view.search_task.take().unwrap()
-            })
-            .unwrap();
-        refresh.await;
         let latest = window
             .update(cx, |view, _, _| view.search_task.take().unwrap())
             .unwrap();
@@ -1047,7 +1126,6 @@ mod tests {
             .update(cx, |view, _, _| {
                 assert!(!view.searching);
                 assert!(view.results.is_empty());
-                assert!(view.pending_search.is_none());
             })
             .unwrap();
     }
@@ -1269,6 +1347,193 @@ mod tests {
             cx.opened_url().as_deref(),
             Some("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
         );
+    }
+
+    #[gpui_kit::test]
+    async fn tabs_restore_their_previous_order_without_sorting(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            cx.set_global(Settings { roots: Vec::new() });
+        });
+        let window = cx.open_window(
+            gpui_kit::size(gpui_kit::px(1150.), gpui_kit::px(800.)),
+            |window, cx| {
+                window.set_scroll_layers(false);
+                SearchView::new(None, window, cx)
+            },
+        );
+        let view = window
+            .update(cx, |view, window, cx| {
+                view._poll = gpui_kit::Task::ready(());
+                view.search_task = None;
+                view.snapshot.entries = Arc::new(
+                    (0..500)
+                        .map(|i| {
+                            Arc::new(Entry {
+                                path: PathBuf::from(format!(
+                                    "/fixture/file-{i:03}.{}",
+                                    if i % 50 == 49 { "mp4" } else { "txt" }
+                                )),
+                                is_dir: false,
+                                allocated_size: i as u64 * 4096,
+                                size: i as u64,
+                                modified: Some(
+                                    std::time::SystemTime::UNIX_EPOCH
+                                        + std::time::Duration::from_secs(i),
+                                ),
+                            })
+                        })
+                        .collect(),
+                );
+                view.search(window, cx, true);
+                cx.entity()
+            })
+            .unwrap();
+        cx.wait_for(window.into(), std::time::Duration::from_secs(3), |_, cx| {
+            !view.read(cx).searching && !view.read(cx).sorting
+        })
+        .await;
+        let everything_results = cx.update(|cx| view.read(cx).results.clone());
+        let unexpected_sorts = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = unexpected_sorts.clone();
+        let _subscription = cx.update(|cx| {
+            cx.observe(&view, move |view, cx| {
+                if view.read(cx).sorting && view.read(cx).filter == 0 {
+                    observed.set(observed.get() + 1);
+                }
+            })
+        });
+        window
+            .update(cx, |view, _, cx| {
+                view.sorting = true;
+                // A filter must not wait even when the previous sort never finishes.
+                view.search_task = Some(cx.spawn(async |_, _| std::future::pending().await));
+            })
+            .unwrap();
+        for (step, heading) in [
+            "Name", "Name", "Size", "Size", "Modified", "Modified", "Path", "Path",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.click(("filter", 5usize), cx)
+            })
+            .unwrap();
+            cx.wait_for(window.into(), std::time::Duration::from_secs(3), |_, cx| {
+                !view.read(cx).searching && !view.read(cx).sorting
+            })
+            .await;
+            cx.update_window(window.into(), |_, window, _| {
+                assert_eq!(window.find("results-table").label(), Some("10 results"));
+            })
+            .unwrap();
+            cx.update_window(window.into(), |_, window, cx| window.click(heading, cx))
+                .unwrap();
+            if step % 2 == 0 {
+                cx.wait_for(window.into(), std::time::Duration::from_secs(3), |_, cx| {
+                    !view.read(cx).searching && !view.read(cx).sorting
+                })
+                .await;
+            }
+            cx.update_window(window.into(), |_, window, cx| {
+                window.click(("filter", 0usize), cx)
+            })
+            .unwrap();
+            cx.wait_for(
+                window.into(),
+                std::time::Duration::from_secs(3),
+                |window, cx| {
+                    window.find("results-table").label() == Some("500 results")
+                        && !view.read(cx).sorting
+                        && !view.read(cx).searching
+                },
+            )
+            .await;
+            cx.update_window(window.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert!(
+                    window.try_find(("result", 0usize)).is_some(),
+                    "{heading}: Everything should show the start of the sorted results"
+                );
+            })
+            .unwrap();
+            cx.update(|cx| {
+                let view = view.read(cx);
+                assert_eq!(view.filter, 0);
+                assert!(Arc::ptr_eq(&view.results, &everything_results));
+                assert!(view.search_task.is_none());
+                assert!(!view.sorting);
+                assert!(!view.descending);
+                assert_eq!(view.results[0].path, PathBuf::from("/fixture/file-000.txt"));
+            });
+        }
+        assert_eq!(unexpected_sorts.get(), 0, "Changing tabs must not sort");
+        let (videos, sort, descending) = cx.update(|cx| {
+            let saved = view.read(cx).filter_results[5].as_ref().unwrap();
+            (saved.results.clone(), saved.sort, saved.descending)
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.click(("filter", 5usize), cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(Arc::ptr_eq(&view.results, &videos));
+            assert!(view.sort == sort);
+            assert_eq!(view.descending, descending);
+            assert!(view.search_task.is_none());
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.click("search-input", cx);
+            window.input("file-049", cx);
+        })
+        .unwrap();
+        cx.wait_for(window.into(), std::time::Duration::from_secs(3), |_, cx| {
+            !view.read(cx).searching && !view.read(cx).sorting
+        })
+        .await;
+        cx.update_window(window.into(), |_, window, cx| {
+            window.click(("filter", 0usize), cx);
+        })
+        .unwrap();
+        cx.wait_for(
+            window.into(),
+            std::time::Duration::from_secs(3),
+            |window, cx| {
+                window.find("results-table").label() == Some("1 results")
+                    && !view.read(cx).searching
+            },
+        )
+        .await;
+        let task = window
+            .update(cx, |view, window, cx| {
+                let mut snapshot = view.snapshot.clone();
+                snapshot.revision += 1;
+                snapshot.entries = Arc::new(
+                    snapshot
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.path != PathBuf::from("/fixture/file-049.mp4"))
+                        .cloned()
+                        .collect(),
+                );
+                view.update_snapshot(snapshot, window, cx);
+                view.search_task.take().unwrap()
+            })
+            .unwrap();
+        task.await;
+        cx.update_window(window.into(), |_, window, cx| {
+            window.click(("filter", 5usize), cx);
+        })
+        .unwrap();
+        cx.wait_for(
+            window.into(),
+            std::time::Duration::from_secs(3),
+            |window, _| window.find("results-table").label() == Some("0 results"),
+        )
+        .await;
     }
 
     #[gpui_kit::test]
