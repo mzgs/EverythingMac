@@ -51,7 +51,8 @@ impl Settings {
     pub(crate) fn path() -> io::Result<PathBuf> {
         let directory = dirs::data_local_dir()
             .ok_or_else(|| io::Error::other("Could not find the application data directory"))?;
-        Ok(directory.join(env!("CARGO_PKG_NAME")).join("settings.json"))
+        // Keep the original data directory so the package rename preserves saved data.
+        Ok(directory.join("eveythingmac").join("settings.json"))
     }
 
     pub(crate) fn load(path: &Path) -> io::Result<Self> {
@@ -234,10 +235,7 @@ mod tests {
             assert!(settings.save(&path).is_err());
             assert_eq!(fs::read_to_string(&path)?, r#"{"roots":-1}"#);
             assert_eq!(fs::read_to_string(&temporary)?, "existing temporary file");
-            assert!(
-                Settings::path()?
-                    .ends_with(Path::new(env!("CARGO_PKG_NAME")).join("settings.json"))
-            );
+            assert!(Settings::path()?.ends_with(Path::new("eveythingmac").join("settings.json")));
             Ok(())
         })();
         fs::remove_dir_all(directory)?;

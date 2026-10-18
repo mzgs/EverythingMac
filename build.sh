@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")"
-app_name="eveythingmac"
+app_name="everythingmac"
 
 if [ "$(uname -s)" != Darwin ]; then
     printf '%s\n' 'build.sh requires macOS to create an .app bundle.' >&2
