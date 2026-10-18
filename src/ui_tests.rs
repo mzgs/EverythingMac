@@ -86,7 +86,7 @@ impl Fixture {
                         origin: Point::default(),
                         size: size(px(1150.), px(800.)),
                     })),
-                    ..Default::default()
+                    ..gpui_kit::component::TitleBar::window_options()
                 },
                 cx,
                 |window, cx| {
@@ -147,6 +147,37 @@ fn type_query(window: &mut Window, cx: &mut App, query: &str) {
     window.click("search-input", cx);
     window.press("cmd-a", cx);
     window.input(query, cx);
+}
+
+#[gpui_kit::test]
+async fn custom_title_bar_keeps_search_and_settings_accessible(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let titlebar = window.find("title-bar").bounds();
+        assert_eq!(titlebar.size.height, px(40.));
+        assert!(titlebar.contains(&window.find("app-title").bounds().center()));
+        assert!(titlebar.contains(&window.find("titlebar-settings").bounds().center()));
+        assert!(window.find("search-input").bounds().top() >= titlebar.bottom());
+        assert!(window.find("result-count").visible());
+        assert!(window.try_find("preview-badge").is_none());
+        window.click("titlebar-settings", cx);
+    })
+    .unwrap();
+    wait_dialog(cx, handle, true).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.within("dialog").click("cancel", cx);
+    })
+    .unwrap();
+    wait_dialog(cx, handle, false).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.press("cmd-f", cx);
+        window.input("alpha", cx);
+        assert_eq!(window.find("search-input").value(), Some("alpha"));
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]

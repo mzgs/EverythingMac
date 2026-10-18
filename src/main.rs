@@ -14,7 +14,11 @@ mod settings_view;
 mod ui_tests;
 mod window_state;
 
-use gpui_kit::component::{ActiveTheme, Theme};
+use gpui_kit::component::{
+    ActiveTheme, Icon, Sizable, Theme, TitleBar,
+    button::{Button, ButtonVariants},
+};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use settings::Settings;
 use window_state::WindowState;
@@ -76,11 +80,99 @@ impl AppView {
 }
 
 impl Render for AppView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
+            .flex()
+            .flex_col()
             .bg(cx.theme().background)
-            .child(self.search.clone())
+            .text_color(cx.theme().foreground)
+            .child(
+                TitleBar::new()
+                    .h(px(40.))
+                    .pl(px(96.))
+                    .pr_5()
+                    .border_color(cx.theme().link.opacity(0.16))
+                    .bg(linear_gradient(
+                        175.,
+                        linear_color_stop(cx.theme().title_bar, 0.),
+                        linear_color_stop(cx.theme().background, 1.),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .size(px(26.))
+                                    .rounded(px(7.))
+                                    .border_1()
+                                    .border_color(white().opacity(0.22))
+                                    .shadow_sm()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(linear_gradient(
+                                        135.,
+                                        linear_color_stop(rgb(0x68b8ff), 0.),
+                                        linear_color_stop(rgb(0x5263e8), 1.),
+                                    ))
+                                    .text_color(rgb(0xffffff))
+                                    .child(Icon::new(assets::IconName::Search).small()),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("app-title")
+                                            .test_support()
+                                            .text_size(px(15.))
+                                            .line_height(px(20.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child("Everything Mac"),
+                                    )
+                                    .when(window.window_title().ends_with(" — Preview"), |this| {
+                                        this.child(
+                                            div()
+                                                .id("preview-badge")
+                                                .test_support()
+                                                .px_1p5()
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(cx.theme().link.opacity(0.2))
+                                                .bg(cx.theme().selection)
+                                                .text_size(px(10.))
+                                                .line_height(px(16.))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(cx.theme().link)
+                                                .child("PREVIEW"),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .child(
+                        Button::new("titlebar-settings")
+                            .ghost()
+                            .small()
+                            .size_7()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().background.opacity(0.55))
+                            .text_color(cx.theme().muted_foreground)
+                            .icon(assets::IconName::Settings)
+                            .accessibility_label("Settings")
+                            .tooltip("Settings · ⌘,")
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(OpenSettings), cx)
+                            }),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().child(self.search.clone()))
     }
 }
 
@@ -225,9 +317,10 @@ fn main() {
                     }
                     .into(),
                 ),
-                ..Default::default()
+                traffic_light_position: Some(point(px(16.), px(12.))),
+                ..TitleBar::title_bar_options()
             }),
-            ..Default::default()
+            ..TitleBar::window_options()
         };
         let database_path = settings_path
             .as_ref()
