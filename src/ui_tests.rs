@@ -99,7 +99,7 @@ async fn wait_count(cx: &mut TestAppContext, handle: AnyWindowHandle, count: usi
     cx.wait_for(handle, Duration::from_secs(10), |window, _| {
         // The native index worker needs wall time while GPUI advances its test clock.
         std::thread::sleep(Duration::from_millis(2));
-        window.find("result-count").label() == Some(label.as_str())
+        window.find("results-table").label() == Some(label.as_str())
     })
     .await;
 }
@@ -143,6 +143,7 @@ async fn search_filters_invalid_queries_latest_input_and_keyboard_selection(
     .unwrap();
     wait_count(cx, handle, 2).await;
     cx.update_window(handle, |_, window, cx| {
+        assert_eq!(window.find("result-count").label(), Some("2 filtered · 6 indexed"));
         assert_eq!(window.find(("result", 0usize)).selected(), Some(true));
         window.press("down", cx);
         assert_eq!(window.find(("result", 1usize)).selected(), Some(true));

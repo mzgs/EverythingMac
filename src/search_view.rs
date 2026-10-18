@@ -19,7 +19,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 actions!(
@@ -61,7 +61,6 @@ pub(crate) struct SearchView {
     descending: bool,
     searching: bool,
     pending_open: Option<bool>,
-    elapsed: Duration,
     error: Option<String>,
     generation: Arc<AtomicU64>,
     _subscription: Subscription,
@@ -132,7 +131,6 @@ impl SearchView {
             descending: false,
             searching: false,
             pending_open: None,
-            elapsed: Duration::ZERO,
             error: None,
             generation: Arc::new(AtomicU64::new(0)),
             _subscription: subscription,
@@ -183,7 +181,6 @@ impl SearchView {
                     if current.load(Ordering::Relaxed) != generation {
                         return None;
                     }
-                    let start = Instant::now();
                     let mut results = Vec::new();
                     for (i, entry) in entries.iter().enumerate() {
                         if i % 1024 == 0 && current.load(Ordering::Relaxed) != generation {
@@ -218,19 +215,18 @@ impl SearchView {
                     if descending {
                         results.reverse();
                     }
-                    Some((Arc::new(results), start.elapsed()))
+                    Some(Arc::new(results))
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 if this.generation.load(Ordering::Relaxed) != generation {
                     return;
                 }
-                if let Some((results, elapsed)) = result {
+                if let Some(results) = result {
                     this.selected = selected_path
                         .and_then(|path| results.iter().position(|entry| entry.path == path))
                         .or_else(|| (!results.is_empty()).then_some(0));
                     this.results = results;
-                    this.elapsed = elapsed;
                     this.searching = false;
                     if reveal_selection {
                         this.scroll
@@ -376,7 +372,7 @@ impl Render for SearchView {
                 .child(self.heading("Size", Sort::Size, 90., cx))
                 .child(div().w(px(90.)).text_sm().py_2().child("Type"))
                 .child(self.heading("Modified", Sort::Modified, 110., cx)))
-            .child(div().id("results-table").test_support().role(Role::Table).aria_label("Search results").aria_row_count(self.results.len()).relative().flex_1().min_h_0().child(
+            .child(div().id("results-table").test_support().role(Role::Table).aria_label(format!("{} results", self.results.len())).aria_row_count(self.results.len()).relative().flex_1().min_h_0().child(
                 uniform_list("results", results.len(), move |range, _, cx| {
                     range.map(|i| {
                         let entry = &results[i];
@@ -410,7 +406,7 @@ impl Render for SearchView {
                 .child(Button::new("reveal").small().label("Show in Finder").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.open(true, window, cx))))
                 .child(Button::new("copy-path").small().label("Copy path").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, _, cx| this.copy(cx))))
                 .child(div().flex_1())
-                .child(div().id("result-count").test_support().role(Role::Status).aria_label(format!("{} results", self.results.len())).text_xs().text_color(cx.theme().muted_foreground).child(format!("{} results · {} indexed{} · {} ms{}", self.results.len(), self.snapshot.entries.len(), if self.snapshot.scanning { " · checking changes…" } else { "" }, self.elapsed.as_millis(), if self.searching { " · searching…" } else { "" }))))
+                .child(div().id("result-count").test_support().role(Role::Status).aria_label(format!("{} filtered · {} indexed", self.results.len(), self.snapshot.entries.len())).text_xs().text_color(cx.theme().muted_foreground).child(format!("{} filtered · {} indexed", format_count(self.results.len()), format_count(self.snapshot.entries.len())))))
             .children(self.snapshot.warning.clone().map(|warning| div().id("index-warnings").max_h(px(80.)).overflow_y_scroll().px_4().pb_2().text_xs().text_color(cx.theme().muted_foreground).child(warning)))
             .when(self.snapshot.skipped > 0, |this| this.child(div().px_4().pb_2().text_xs().text_color(cx.theme().muted_foreground).child(format!("{} paths could not be read. Check folder permissions or grant Full Disk Access, then rebuild.", self.snapshot.skipped))))
     }
@@ -450,6 +446,18 @@ fn kind_matches(entry: &Entry, filter: usize) -> bool {
     extensions.contains(&ext.as_str())
 }
 
+fn format_count(count: usize) -> String {
+    if count >= 1_000_000_000 {
+        format!("{:.1}B", count as f64 / 1_000_000_000.)
+    } else if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.)
+    } else if count >= 1_000 {
+        format!("{:.1}K", count as f64 / 1_000.)
+    } else {
+        count.to_string()
+    }
+}
+
 fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
         return format!("{bytes} B");
@@ -483,7 +491,7 @@ fn format_modified(time: Option<SystemTime>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchView, format_size, kind_matches};
+    use super::{SearchView, format_count, format_size, kind_matches};
     use crate::{index::Entry, settings::Settings};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AppContext, ScrollStrategy, TestAppContext};
@@ -604,6 +612,23 @@ mod tests {
                 );
             })
             .unwrap();
+        }
+    }
+
+    #[test]
+    fn formats_indexed_counts() {
+        for (count, expected) in [
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1.0K"),
+            (12_500, "12.5K"),
+            (999_000, "999.0K"),
+            (1_000_000, "1.0M"),
+            (1_250_000, "1.2M"),
+            (1_000_000_000, "1.0B"),
+            (1_500_000_000, "1.5B"),
+        ] {
+            assert_eq!(format_count(count), expected);
         }
     }
 
