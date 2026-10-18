@@ -127,6 +127,91 @@ fn type_query(window: &mut Window, cx: &mut App, query: &str) {
 }
 
 #[gpui_kit::test]
+async fn result_context_menu_selects_clicked_row_copies_path_and_dismisses(
+    cx: &mut TestAppContext,
+) {
+    let fixture = Fixture::new();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    for row in [1usize, 0usize] {
+        cx.update_window(handle, |_, window, cx| {
+            window.right_click(("result", row), cx)
+        })
+        .unwrap();
+        cx.wait_for(handle, Duration::from_secs(3), |window, _| {
+            window.try_find("popup-menu").is_some()
+        })
+        .await;
+        let expected = cx
+            .update_window(handle, |_, window, cx| {
+                assert_eq!(window.find(("result", row)).selected(), Some(true));
+                let expected = window.find(("result", row)).label().unwrap().to_owned();
+                let menu = window.within("popup-menu");
+                assert_eq!(menu.find(0usize).label(), Some("Open"));
+                assert_eq!(menu.find(1usize).label(), Some("Show in Finder"));
+                assert_eq!(menu.find(2usize).label(), Some("Copy path"));
+                assert_eq!(menu.find(4usize).label(), Some("Move to Trash"));
+                window.within("popup-menu").click(2usize, cx);
+                expected
+            })
+            .unwrap();
+        cx.wait_for(handle, Duration::from_secs(3), |window, cx| {
+            window.try_find("popup-menu").is_none()
+                && cx.read_from_clipboard().and_then(|item| item.text()) == Some(expected.clone())
+        })
+        .await;
+    }
+    cx.update_window(handle, |_, window, cx| {
+        window.right_click(("result", 1usize), cx)
+    })
+    .unwrap();
+    cx.wait_for(handle, Duration::from_secs(3), |window, _| {
+        window.try_find("popup-menu").is_some()
+    })
+    .await;
+    cx.update_window(handle, |_, window, cx| {
+        window.press("escape", cx);
+    })
+    .unwrap();
+    cx.wait_for(handle, Duration::from_secs(3), |window, _| {
+        window.try_find("popup-menu").is_none()
+    })
+    .await;
+}
+
+#[gpui_kit::test]
+async fn trash_menu_reports_missing_file_without_touching_other_results(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.right_click(("result", 1usize), cx);
+    })
+    .unwrap();
+    cx.wait_for(handle, Duration::from_secs(3), |window, _| {
+        window.try_find("popup-menu").is_some()
+    })
+    .await;
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(
+            window.find(("result", 1usize)).label(),
+            fixture.root.join("alpha.txt").to_str()
+        );
+        fs::remove_file(fixture.root.join("alpha.txt")).unwrap();
+        window.within("popup-menu").click(4usize, cx);
+    })
+    .unwrap();
+    cx.wait_for(handle, Duration::from_secs(3), |window, _| {
+        window
+            .try_find("search-error")
+            .and_then(|error| error.label().map(str::to_owned))
+            .is_some_and(|label| label.starts_with("Couldn’t move to Trash:"))
+    })
+    .await;
+    assert_eq!(fs::read(fixture.root.join("beta.JPG")).unwrap(), b"fixture");
+}
+
+#[gpui_kit::test]
 async fn help_text_can_be_selected_and_copied_but_not_edited(cx: &mut TestAppContext) {
     let fixture = Fixture::new();
     let handle = fixture.open(cx);

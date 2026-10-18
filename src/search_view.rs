@@ -10,6 +10,7 @@ use gpui_kit::{
         ActiveTheme, Disableable, Icon, Selectable, Sizable,
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState},
+        menu::{ContextMenuExt, PopupMenuItem},
         scroll::Scrollbar,
     },
     *,
@@ -297,6 +298,21 @@ impl SearchView {
         }
     }
 
+    fn trash(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { move_to_trash(&path) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.error = Some(format!("Couldn’t move to Trash: {error}"));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn move_selection(&mut self, direction: isize, cx: &mut Context<Self>) {
         if self.results.is_empty() {
             return;
@@ -362,6 +378,7 @@ impl Render for SearchView {
         let results = self.results.clone();
         let selected = self.selected;
         let owner = cx.entity().downgrade();
+        let action_context = self.input.focus_handle(cx);
         let no_results = self.results.is_empty();
         let (empty_icon, empty_title, empty_description) = if self.roots.is_empty() {
             (
@@ -441,6 +458,9 @@ impl Render for SearchView {
                         let parent = entry.path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
                         let kind = if entry.is_dir { "Folder".into() } else { entry.path.extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_else(|| "File".into()) };
                         let owner = owner.clone();
+                        let click_owner = owner.clone();
+                        let action_context = action_context.clone();
+                        let trash_path = entry.path.clone();
                         div().id(("result", i)).test_support().role(Role::Row).aria_label(entry.path.to_string_lossy().into_owned())
                             .aria_selected(selected == Some(i)).flex().items_center().h(px(36.)).px_5().text_sm().w_full().cursor_pointer()
                             .when(i % 2 == 1, |row| row.bg(cx.theme().table_even))
@@ -455,11 +475,28 @@ impl Render for SearchView {
                             .child(div().w(px(90.)).flex_shrink_0().truncate().child(kind))
                             .child(div().w(px(110.)).flex_shrink_0().child(format_modified(entry.modified)))
                             .on_click(move |event, window, cx| {
-                                let _ = owner.update(cx, |this, cx| {
+                                let _ = click_owner.update(cx, |this, cx| {
                                     this.selected = Some(i);
                                     if event.click_count() == 2 { this.open(false, window, cx); }
                                     cx.notify();
                                 });
+                            })
+                            .context_menu(move |menu, _, cx| {
+                                let _ = owner.update(cx, |this, cx| {
+                                    this.selected = Some(i);
+                                    cx.notify();
+                                });
+                                let trash_owner = owner.clone();
+                                let trash_path = trash_path.clone();
+                                menu.action_context(action_context.clone())
+                                    .menu_with_icon("Open", IconName::ExternalLink, Box::new(OpenResult))
+                                    .menu_with_icon("Show in Finder", IconName::FolderOpen, Box::new(RevealResult))
+                                    .menu_with_icon("Copy path", IconName::Copy, Box::new(CopyPath))
+                                    .separator()
+                                    .item(PopupMenuItem::new("Move to Trash").icon(IconName::Trash)
+                                        .on_click(move |_, window, cx| {
+                                            let _ = trash_owner.update(cx, |this, cx| this.trash(trash_path.clone(), window, cx));
+                                        }))
                             }).into_any_element()
                     }).collect()
                 }).size_full().track_scroll(&self.scroll)
@@ -558,6 +595,17 @@ fn format_size(bytes: u64) -> String {
     format!("{value:.1} {unit}")
 }
 
+fn move_to_trash(path: &std::path::Path) -> Result<Option<PathBuf>, String> {
+    use objc2_foundation::{NSFileManager, NSURL};
+
+    let url = NSURL::from_file_path(path).ok_or("Invalid file path")?;
+    let mut destination = None;
+    NSFileManager::defaultManager()
+        .trashItemAtURL_resultingItemURL_error(&url, Some(&mut destination))
+        .map_err(|error| error.to_string())?;
+    Ok(destination.and_then(|url| url.to_file_path()))
+}
+
 fn format_modified(time: Option<SystemTime>) -> String {
     let Some(time) = time else {
         return "—".into();
@@ -575,11 +623,57 @@ fn format_modified(time: Option<SystemTime>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchView, format_count, format_size, kind_matches};
+    use super::{SearchView, format_count, format_size, kind_matches, move_to_trash};
     use crate::{index::Entry, settings::Settings};
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
     use gpui_kit::{AppContext, ScrollStrategy, TestAppContext};
     use std::{path::PathBuf, sync::Arc};
+
+    #[test]
+    fn trash_preserves_contents_and_symlink_targets_and_reports_invalid_paths() {
+        use std::{
+            fs,
+            os::unix::fs::symlink,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let directory = std::env::temp_dir().join(format!(
+            "everything-trash-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let file = directory.join("a 'quoted' 雪; file.txt");
+        let folder = directory.join("folder");
+        let link = directory.join("link");
+        fs::write(&file, b"keep this content").unwrap();
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("nested.txt"), b"nested content").unwrap();
+        symlink(&file, &link).unwrap();
+        for path in [&link, &file, &folder] {
+            let destination = move_to_trash(path).unwrap().unwrap();
+            let original_missing = fs::symlink_metadata(path).is_err();
+            fs::rename(destination, path).unwrap();
+            assert!(original_missing);
+            assert_eq!(fs::read(&file).unwrap(), b"keep this content");
+        }
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read(folder.join("nested.txt")).unwrap(),
+            b"nested content"
+        );
+        assert!(move_to_trash(&directory.join("missing")).is_err());
+        assert!(move_to_trash(&directory.join("invalid\0path")).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[gpui_kit::test]
     async fn rebuild_cache_is_in_settings_and_rescans(cx: &mut TestAppContext) {
