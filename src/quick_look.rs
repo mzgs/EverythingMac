@@ -8,9 +8,9 @@ use objc2_quick_look_ui::{
 };
 use std::{cell::RefCell, path::Path};
 
-#[derive(Default)]
 struct PreviewItems {
     item: RefCell<Option<Retained<NSURL>>>,
+    window: Retained<NSWindow>,
 }
 
 define_class!(
@@ -69,10 +69,19 @@ define_class!(
         #[unsafe(method(previewPanel:handleEvent:))]
         unsafe fn handle_preview_event(&self, panel: Option<&QLPreviewPanel>, event: Option<&NSEvent>) -> bool {
             if let (Some(panel), Some(event)) = (panel, event) {
-                // Space and Escape close the preview while its native window has keyboard focus.
-                if event.r#type() == NSEventType::KeyDown && matches!(event.keyCode(), 49 | 53) {
-                    panel.orderOut(None);
-                    true
+                if event.r#type() == NSEventType::KeyDown {
+                    match event.keyCode() {
+                        49 | 53 => {
+                            panel.orderOut(None);
+                            true
+                        }
+                        125 | 126 => {
+                            // Let the file window's existing arrow bindings own selection and scrolling.
+                            self.ivars().window.sendEvent(event);
+                            true
+                        }
+                        _ => false,
+                    }
                 } else {
                     false
                 }
@@ -85,7 +94,6 @@ define_class!(
 
 pub(crate) struct Preview {
     controller: Retained<EverythingPreviewController>,
-    window: Retained<NSWindow>,
     previous_responder: Option<Retained<NSResponder>>,
 }
 
@@ -95,7 +103,10 @@ impl Preview {
         let window = NSApplication::sharedApplication(mtm)
             .mainWindow()
             .ok_or("No active file window")?;
-        let allocated = EverythingPreviewController::alloc(mtm).set_ivars(PreviewItems::default());
+        let allocated = EverythingPreviewController::alloc(mtm).set_ivars(PreviewItems {
+            item: RefCell::new(None),
+            window: window.clone(),
+        });
         // The controller stays retained while it is installed in the responder chain.
         unsafe {
             let controller: Retained<EverythingPreviewController> =
@@ -105,7 +116,6 @@ impl Preview {
             window.setNextResponder(Some(&controller));
             Ok(Self {
                 controller,
-                window,
                 previous_responder,
             })
         }
@@ -129,6 +139,21 @@ impl Preview {
                 return Err("Quick Look couldn’t attach to the file window".into());
             }
             panel.reloadData();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn update_if_visible(&self, path: &Path) -> Result<(), String> {
+        let mtm = self.controller.mtm();
+        unsafe {
+            if QLPreviewPanel::sharedPreviewPanelExists(mtm)
+                && let Some(panel) = QLPreviewPanel::sharedPreviewPanel(mtm)
+                && panel.isVisible()
+                && self.owns(&panel)
+            {
+                *self.controller.ivars().item.borrow_mut() = Some(preview_item(path)?);
+                panel.reloadData();
+            }
         }
         Ok(())
     }
@@ -161,7 +186,9 @@ impl Drop for Preview {
                     panel.orderOut(None);
                 }
             }
-            self.window
+            self.controller
+                .ivars()
+                .window
                 .setNextResponder(self.previous_responder.as_deref());
             if let Some(panel) = panel {
                 panel.updateController();

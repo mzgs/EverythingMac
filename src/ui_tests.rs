@@ -169,6 +169,12 @@ async fn selecting_results_blurs_search_and_space_only_previews_results(cx: &mut
         assert_eq!(window.find("search-input").value(), Some("alpha "));
         window.press("down", cx);
         assert_eq!(window.find(("result", 1usize)).selected(), Some(true));
+        window.press("down", cx);
+        assert_eq!(window.find(("result", 1usize)).selected(), Some(true));
+        window.press("up", cx);
+        assert_eq!(window.find(("result", 0usize)).selected(), Some(true));
+        window.press("up", cx);
+        assert_eq!(window.find(("result", 0usize)).selected(), Some(true));
         window.press("space", cx);
         assert_eq!(previews.get(), 2);
         window.press("cmd-f", cx);

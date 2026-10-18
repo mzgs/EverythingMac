@@ -457,6 +457,12 @@ impl SearchView {
     fn select_result(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = Some(index);
         self.results_focus.focus(window, cx);
+        if let Some(preview) = &self.preview
+            && let Some(entry) = self.results.get(index)
+            && let Err(error) = preview.update_if_visible(&entry.path)
+        {
+            self.error = Some(format!("Couldn’t preview result: {error}"));
+        }
         cx.notify();
     }
 
