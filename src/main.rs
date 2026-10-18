@@ -1,8 +1,10 @@
 mod bulk;
+mod file_actions;
 mod fs_events;
 mod index;
 mod index_db;
 mod query;
+mod quick_look;
 mod search_view;
 mod settings;
 mod settings_view;
@@ -209,6 +211,7 @@ fn main() {
             KeyBinding::new("down", search_view::NextResult, Some("Everything")),
             KeyBinding::new("up", search_view::PreviousResult, Some("Everything")),
             KeyBinding::new("enter", search_view::OpenResult, Some("Everything")),
+            KeyBinding::new("space", search_view::QuickLook, Some("FileResults")),
             KeyBinding::new("cmd-,", OpenSettings, None),
             #[cfg(not(target_os = "macos"))]
             KeyBinding::new("ctrl-q", Quit, None),

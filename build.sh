@@ -32,6 +32,7 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 <key>NSDesktopFolderUsageDescription</key><string>Index filenames and metadata on your Desktop so you can find your files.</string>
 <key>NSDownloadsFolderUsageDescription</key><string>Index filenames and metadata in Downloads so you can find your files.</string>
 <key>NSRemovableVolumesUsageDescription</key><string>Search filenames on volumes you add to indexed folders.</string>
+<key>NSAppleEventsUsageDescription</key><string>Show file information in Finder when you choose Get Info.</string>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict></plist>
 PLIST

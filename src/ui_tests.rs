@@ -57,6 +57,7 @@ impl Fixture {
                 KeyBinding::new("down", search_view::NextResult, Some("Everything")),
                 KeyBinding::new("up", search_view::PreviousResult, Some("Everything")),
                 KeyBinding::new("cmd-f", search_view::FocusSearch, Some("Everything")),
+                KeyBinding::new("space", search_view::QuickLook, Some("FileResults")),
                 KeyBinding::new("cmd-,", OpenSettings, None),
             ]);
             let (handle, view) = gpui_kit::open_window(
@@ -127,6 +128,61 @@ fn type_query(window: &mut Window, cx: &mut App, query: &str) {
 }
 
 #[gpui_kit::test]
+async fn selecting_results_blurs_search_and_space_only_previews_results(cx: &mut TestAppContext) {
+    use std::{cell::Cell, rc::Rc};
+
+    let fixture = Fixture::new();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    let previews = Rc::new(Cell::new(0));
+    let observed = previews.clone();
+    let _subscription = cx.update(|cx| {
+        cx.intercept_keystrokes(move |event, window, cx| {
+            if event.keystroke.key == "space"
+                && window.focused(cx).is_some_and(|focus| {
+                    !window
+                        .bindings_for_action_in(&search_view::QuickLook, &focus)
+                        .is_empty()
+                })
+            {
+                observed.set(observed.get() + 1);
+                cx.stop_propagation();
+            }
+        })
+    });
+    cx.update_window(handle, |_, window, cx| {
+        type_query(window, cx, "alpha");
+        window.press("space", cx);
+        assert_eq!(window.find("search-input").value(), Some("alpha "));
+        assert_eq!(previews.get(), 0);
+    })
+    .unwrap();
+    wait_count(cx, handle, 2).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click(("result", 0usize), cx);
+        assert_eq!(window.find("search-input").focused(), Some(false));
+        assert_eq!(window.find("results-table").focused(), Some(true));
+        window.press("space", cx);
+        assert_eq!(previews.get(), 1);
+        assert_eq!(window.find("search-input").value(), Some("alpha "));
+        window.press("down", cx);
+        assert_eq!(window.find(("result", 1usize)).selected(), Some(true));
+        window.press("space", cx);
+        assert_eq!(previews.get(), 2);
+        window.press("cmd-f", cx);
+        assert_eq!(window.find("search-input").focused(), Some(true));
+        window.press("space", cx);
+        assert_eq!(window.find("search-input").value(), Some("alpha  "));
+        assert_eq!(previews.get(), 2);
+        window.press("down", cx);
+        assert_eq!(window.find("search-input").focused(), Some(false));
+        window.press("space", cx);
+        assert_eq!(previews.get(), 3);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 async fn result_context_menu_selects_clicked_row_copies_path_and_dismisses(
     cx: &mut TestAppContext,
 ) {
@@ -149,9 +205,12 @@ async fn result_context_menu_selects_clicked_row_copies_path_and_dismisses(
                 let menu = window.within("popup-menu");
                 assert_eq!(menu.find(0usize).label(), Some("Open"));
                 assert_eq!(menu.find(1usize).label(), Some("Show in Finder"));
-                assert_eq!(menu.find(2usize).label(), Some("Copy path"));
-                assert_eq!(menu.find(4usize).label(), Some("Move to Trash"));
-                window.within("popup-menu").click(2usize, cx);
+                assert_eq!(menu.find(2usize).label(), Some("Get Info"));
+                assert_eq!(menu.find(4usize).label(), Some("Copy"));
+                assert_eq!(menu.find(5usize).label(), Some("Copy path"));
+                assert_eq!(menu.find(6usize).label(), Some("Rename…"));
+                assert_eq!(menu.find(8usize).label(), Some("Move to Trash"));
+                window.within("popup-menu").click(5usize, cx);
                 expected
             })
             .unwrap();
@@ -177,6 +236,16 @@ async fn result_context_menu_selects_clicked_row_copies_path_and_dismisses(
         window.try_find("popup-menu").is_none()
     })
     .await;
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(window.find("search-input").focused(), Some(false));
+        assert_eq!(window.find("results-table").focused(), Some(true));
+        assert!(
+            !window
+                .bindings_for_action_in(&search_view::QuickLook, &window.focused(cx).unwrap())
+                .is_empty()
+        );
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]
@@ -198,7 +267,7 @@ async fn trash_menu_reports_missing_file_without_touching_other_results(cx: &mut
             fixture.root.join("alpha.txt").to_str()
         );
         fs::remove_file(fixture.root.join("alpha.txt")).unwrap();
-        window.within("popup-menu").click(4usize, cx);
+        window.within("popup-menu").click(8usize, cx);
     })
     .unwrap();
     cx.wait_for(handle, Duration::from_secs(3), |window, _| {
@@ -209,6 +278,75 @@ async fn trash_menu_reports_missing_file_without_touching_other_results(cx: &mut
     })
     .await;
     assert_eq!(fs::read(fixture.root.join("beta.JPG")).unwrap(), b"fixture");
+}
+
+#[gpui_kit::test]
+async fn rename_menu_can_cancel_reject_collisions_and_update_results(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    for cancel in [true, false] {
+        cx.update_window(handle, |_, window, cx| {
+            window.right_click(("result", 1usize), cx);
+        })
+        .unwrap();
+        cx.wait_for(handle, Duration::from_secs(3), |window, _| {
+            window.try_find("popup-menu").is_some()
+        })
+        .await;
+        cx.update_window(handle, |_, window, cx| {
+            window.within("popup-menu").click(6usize, cx);
+        })
+        .unwrap();
+        wait_dialog(cx, handle, true).await;
+        cx.update_window(handle, |_, window, cx| {
+            assert_eq!(window.find("rename-input").value(), Some("alpha.txt"));
+            window.click("rename-input", cx);
+            window.press("cmd-a", cx);
+            window.input("beta.JPG", cx);
+            if cancel {
+                window.within("dialog").click("cancel", cx);
+            } else {
+                window.within("dialog").click("rename", cx);
+            }
+        })
+        .unwrap();
+        if cancel {
+            wait_dialog(cx, handle, false).await;
+        } else {
+            cx.wait_for(handle, Duration::from_secs(3), |window, _| {
+                window.try_find("rename-error").is_some()
+            })
+            .await;
+            assert_eq!(
+                fs::read(fixture.root.join("alpha.txt")).unwrap(),
+                b"fixture"
+            );
+            assert_eq!(fs::read(fixture.root.join("beta.JPG")).unwrap(), b"fixture");
+            cx.update_window(handle, |_, window, cx| {
+                window.click("rename-input", cx);
+                window.press("cmd-a", cx);
+                window.input("renamed 雪.txt", cx);
+                window.press("enter", cx);
+            })
+            .unwrap();
+            wait_dialog(cx, handle, false).await;
+        }
+    }
+    assert!(!fixture.root.join("alpha.txt").exists());
+    assert_eq!(
+        fs::read(fixture.root.join("renamed 雪.txt")).unwrap(),
+        b"fixture"
+    );
+    cx.wait_for(handle, Duration::from_secs(10), |window, _| {
+        std::thread::sleep(Duration::from_millis(2));
+        (0..6usize).any(|row| {
+            window.try_find(("result", row)).is_some_and(|result| {
+                result.label() == fixture.root.join("renamed 雪.txt").to_str()
+            })
+        })
+    })
+    .await;
 }
 
 #[gpui_kit::test]

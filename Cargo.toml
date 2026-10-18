@@ -8,7 +8,10 @@ publish = false
 dirs = "6"
 fsevent-sys = "4"
 libc = "0.2"
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard", "NSApplication", "NSResponder", "NSWindow", "NSEvent"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSFileManager", "NSURL", "NSError", "NSString"] }
+objc2-quick-look-ui = { version = "0.3.2", default-features = false, features = ["std", "QLPreviewPanel", "QLPreviewItem", "objc2-app-kit"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

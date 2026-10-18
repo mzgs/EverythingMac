@@ -7,7 +7,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     component::{
-        ActiveTheme, Disableable, Icon, Selectable, Sizable,
+        ActiveTheme, Disableable, Icon, Selectable, Sizable, WindowExt,
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState},
         menu::{ContextMenuExt, PopupMenuItem},
@@ -32,6 +32,7 @@ actions!(
         OpenResult,
         RevealResult,
         CopyPath,
+        QuickLook,
         NextResult,
         PreviousResult,
         SearchHelp
@@ -48,6 +49,8 @@ enum Sort {
 
 pub(crate) struct SearchView {
     input: Entity<InputState>,
+    results_focus: FocusHandle,
+    preview: Option<crate::quick_look::Preview>,
     index: Index,
     roots: Vec<PathBuf>,
     database_path: Option<PathBuf>,
@@ -118,6 +121,8 @@ impl SearchView {
         });
         let mut view = Self {
             input,
+            results_focus: cx.focus_handle().tab_stop(true),
+            preview: None,
             index,
             roots,
             database_path,
@@ -261,15 +266,24 @@ impl SearchView {
         let Some(entry) = self.selected.and_then(|i| self.results.get(i)) else {
             return;
         };
-        let path = entry.path.clone();
+        let mut command = std::process::Command::new("/usr/bin/open");
+        if reveal {
+            command.arg("-R");
+        }
+        command.arg(&entry.path);
+        self.run_command(command, "open result", window, cx);
+    }
+
+    fn run_command(
+        &mut self,
+        mut command: std::process::Command,
+        operation: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let mut command = std::process::Command::new("/usr/bin/open");
-                    if reveal {
-                        command.arg("-R");
-                    }
-                    command.arg(&path);
                     let output = command.output()?;
                     if output.status.success() {
                         Ok(())
@@ -282,7 +296,7 @@ impl SearchView {
                 .await;
             if let Err(error) = result {
                 let _ = this.update(cx, |this, cx| {
-                    this.error = Some(format!("Couldn’t open result: {error}"));
+                    this.error = Some(format!("Couldn’t {operation}: {error}"));
                     cx.notify();
                 });
             }
@@ -313,19 +327,42 @@ impl SearchView {
         .detach();
     }
 
-    fn move_selection(&mut self, direction: isize, cx: &mut Context<Self>) {
+    fn select_result(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected = Some(index);
+        self.results_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn quick_look(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(entry) = self.selected.and_then(|i| self.results.get(i)) {
+            let result = (|| {
+                let preview = match self.preview.as_ref() {
+                    Some(preview) => preview,
+                    None => self.preview.insert(crate::quick_look::Preview::new()?),
+                };
+                preview.toggle(&entry.path)
+            })();
+            if let Err(error) = result {
+                self.error = Some(format!("Couldn’t preview result: {error}"));
+                cx.notify();
+            }
+        }
+    }
+
+    fn move_selection(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
         if self.results.is_empty() {
             return;
         }
-        self.selected = Some(
+        self.select_result(
             self.selected
                 .unwrap_or(0)
                 .saturating_add_signed(direction)
                 .min(self.results.len() - 1),
+            window,
+            cx,
         );
         self.scroll
             .scroll_to_item(self.selected.unwrap(), ScrollStrategy::Top);
-        cx.notify();
     }
 
     fn heading(
@@ -378,7 +415,7 @@ impl Render for SearchView {
         let results = self.results.clone();
         let selected = self.selected;
         let owner = cx.entity().downgrade();
-        let action_context = self.input.focus_handle(cx);
+        let action_context = self.results_focus.clone();
         let no_results = self.results.is_empty();
         let (empty_icon, empty_title, empty_description) = if self.roots.is_empty() {
             (
@@ -418,10 +455,10 @@ impl Render for SearchView {
             .on_action(cx.listener(|this, _: &OpenResult, window, cx| this.open(false, window, cx)))
             .on_action(cx.listener(|this, _: &RevealResult, window, cx| this.open(true, window, cx)))
             .on_action(cx.listener(|this, _: &CopyPath, _, cx| this.copy(cx)))
-            .on_action(cx.listener(|this, _: &NextResult, _, cx| this.move_selection(1, cx)))
-            .on_action(cx.listener(|this, _: &PreviousResult, _, cx| this.move_selection(-1, cx)))
+            .on_action(cx.listener(|this, _: &NextResult, window, cx| this.move_selection(1, window, cx)))
+            .on_action(cx.listener(|this, _: &PreviousResult, window, cx| this.move_selection(-1, window, cx)))
             .on_action(cx.listener(|_, _: &SearchHelp, window, cx| crate::settings_view::show_error(
-                "Search filenames as you type.\n\nreport budget — both words\n\"annual report\" — exact phrase\n*.pdf | *.docx — either pattern\n!backup — exclude a word\n<cat | dog> photo — group terms\next:jpg;png — extension filter\nfile: / folder: — kind\npath:Projects — search full path\nsize:>10mb — size filter\n\nAa: case sensitive. Path: match full paths. Regex: treat the entire query as a regular expression.\n\n⌘F Search · ↓/↑ Select · Return Open · ⌘Return Reveal · ⇧⌘C Copy path · ⌘R Rebuild · ⌘, Folders".into(), window, cx)))
+                "Search filenames as you type.\n\nreport budget — both words\n\"annual report\" — exact phrase\n*.pdf | *.docx — either pattern\n!backup — exclude a word\n<cat | dog> photo — group terms\next:jpg;png — extension filter\nfile: / folder: — kind\npath:Projects — search full path\nsize:>10mb — size filter\n\nAa: case sensitive. Path: match full paths. Regex: treat the entire query as a regular expression.\n\n⌘F Search · ↓/↑ Select · Space Quick Look · Return Open · ⌘Return Reveal · ⇧⌘C Copy path · ⌘R Rebuild · ⌘, Folders".into(), window, cx)))
             .child(div().flex().items_center().gap_2().px_5().pt_4().pb_3()
                 .child(div().flex_1().min_w_0().child(Input::new(&self.input).id("search-input").aria_label("Search files and folders")
                 .prefix(Icon::new(IconName::Search).small().text_color(cx.theme().muted_foreground))
@@ -450,7 +487,9 @@ impl Render for SearchView {
                 .child(self.heading("Size", Sort::Size, 90., cx))
                 .child(div().w(px(90.)).text_sm().py_2().child("Type"))
                 .child(self.heading("Modified", Sort::Modified, 110., cx)))
-            .child(div().id("results-table").test_support().role(Role::Table).aria_label(format!("{} results", self.results.len())).aria_row_count(self.results.len()).relative().flex_1().min_h_0().bg(cx.theme().table).child(
+            .child(div().id("results-table").test_support().track_focus(&self.results_focus).key_context("FileResults")
+                .on_action(cx.listener(|this, _: &QuickLook, window, cx| this.quick_look(window, cx)))
+                .role(Role::Table).aria_label(format!("{} results", self.results.len())).aria_row_count(self.results.len()).relative().flex_1().min_h_0().bg(cx.theme().table).child(
                 uniform_list("results", results.len(), move |range, _, cx| {
                     range.map(|i| {
                         let entry = &results[i];
@@ -459,8 +498,9 @@ impl Render for SearchView {
                         let kind = if entry.is_dir { "Folder".into() } else { entry.path.extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_else(|| "File".into()) };
                         let owner = owner.clone();
                         let click_owner = owner.clone();
+                        let mouse_owner = owner.clone();
                         let action_context = action_context.clone();
-                        let trash_path = entry.path.clone();
+                        let menu_path = entry.path.clone();
                         div().id(("result", i)).test_support().role(Role::Row).aria_label(entry.path.to_string_lossy().into_owned())
                             .aria_selected(selected == Some(i)).flex().items_center().h(px(36.)).px_5().text_sm().w_full().cursor_pointer()
                             .when(i % 2 == 1, |row| row.bg(cx.theme().table_even))
@@ -474,24 +514,56 @@ impl Render for SearchView {
                             .child(div().w(px(90.)).flex_shrink_0().child(if entry.is_dir { "—".into() } else { format_size(entry.size) }))
                             .child(div().w(px(90.)).flex_shrink_0().truncate().child(kind))
                             .child(div().w(px(110.)).flex_shrink_0().child(format_modified(entry.modified)))
+                            .capture_any_mouse_down(move |_, window, cx| {
+                                let _ = mouse_owner.update(cx, |this, cx| this.select_result(i, window, cx));
+                            })
                             .on_click(move |event, window, cx| {
                                 let _ = click_owner.update(cx, |this, cx| {
-                                    this.selected = Some(i);
+                                    this.select_result(i, window, cx);
                                     if event.click_count() == 2 { this.open(false, window, cx); }
-                                    cx.notify();
                                 });
                             })
-                            .context_menu(move |menu, _, cx| {
-                                let _ = owner.update(cx, |this, cx| {
-                                    this.selected = Some(i);
-                                    cx.notify();
-                                });
+                            .context_menu(move |menu, window, cx| {
+                                let dismiss_owner = owner.clone();
+                                // The menu’s temporary trigger loses its focus path when dismissed.
+                                cx.subscribe_in(&cx.entity(), window, move |_, _, _: &DismissEvent, window, cx| {
+                                    let _ = dismiss_owner.update(cx, |this, cx| {
+                                        if !this.input.focus_handle(cx).is_focused(window) && !window.has_active_dialog(cx) {
+                                            this.results_focus.focus(window, cx);
+                                        }
+                                    });
+                                }).detach();
                                 let trash_owner = owner.clone();
-                                let trash_path = trash_path.clone();
+                                let trash_path = menu_path.clone();
+                                let info_owner = owner.clone();
+                                let info_path = menu_path.clone();
+                                let copy_owner = owner.clone();
+                                let copy_path = menu_path.clone();
+                                let rename_path = menu_path.clone();
                                 menu.action_context(action_context.clone())
                                     .menu_with_icon("Open", IconName::ExternalLink, Box::new(OpenResult))
                                     .menu_with_icon("Show in Finder", IconName::FolderOpen, Box::new(RevealResult))
+                                    .item(PopupMenuItem::new("Get Info").icon(IconName::Info)
+                                        .on_click(move |_, window, cx| {
+                                            let _ = info_owner.update(cx, |this, cx| this.run_command(
+                                                crate::file_actions::get_info_command(&info_path), "get file info", window, cx));
+                                        }))
+                                    .separator()
+                                    .item(PopupMenuItem::new("Copy").icon(IconName::Copy)
+                                        .on_click(move |_, _, cx| {
+                                            if let Err(error) = crate::file_actions::copy_file(&copy_path, &objc2_app_kit::NSPasteboard::generalPasteboard()) {
+                                                let _ = copy_owner.update(cx, |this, cx| {
+                                                    this.error = Some(format!("Couldn’t copy file: {error}"));
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }))
                                     .menu_with_icon("Copy path", IconName::Copy, Box::new(CopyPath))
+                                    .item(PopupMenuItem::new("Rename…").icon(IconName::Pencil)
+                                        .on_click(move |_, window, cx| {
+                                            let path = rename_path.clone();
+                                            window.defer(cx, move |window, cx| crate::file_actions::show_rename(path, window, cx));
+                                        }))
                                     .separator()
                                     .item(PopupMenuItem::new("Move to Trash").icon(IconName::Trash)
                                         .on_click(move |_, window, cx| {
@@ -528,7 +600,7 @@ impl Render for SearchView {
                 .child(Button::new("full-disk-access").ghost().small().icon(IconName::TriangleAlert).accessibility_label("Needs Full Disk Access")
                     .tooltip(self.snapshot.scan_warning.clone().unwrap_or_else(|| "Open Full Disk Access in System Settings".into()))
                     .on_click(|_, _, cx| cx.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")))
-                .child(div().id("navigation-hints").test_support().text_xs().text_color(cx.theme().muted_foreground).child("↑ ↓ Navigate    ↵ Open    ⌘ ↵ Reveal"))))
+                .child(div().id("navigation-hints").test_support().text_xs().text_color(cx.theme().muted_foreground).child("↑ ↓ Navigate    Space Quick Look    ↵ Open    ⌘ ↵ Reveal"))))
             .children(self.snapshot.warning.clone().map(|warning| div().id("index-warnings").test_support().role(Role::Status).aria_label(warning.clone()).max_h(px(80.)).overflow_y_scroll().px_5().pb_2().bg(cx.theme().status_bar).text_xs().text_color(cx.theme().muted_foreground).child(warning)))
     }
 }

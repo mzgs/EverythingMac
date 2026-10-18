@@ -27,7 +27,7 @@ GPUI Fast's scroll-tile cache is disabled at startup because version 0.1.6 can o
 
 Your home folder is indexed by default. Open **Indexed folders** (`⌘,`) to add/remove folders or mounted volumes, then save. **Rebuild cache** is also available in this settings dialog to rescan the saved indexed folders. Nested roots are deduplicated by the indexer. Hidden files are included; symbolic links are listed without following them. Names, sizes and modified times are scanned in the background; file contents are never read by the indexer.
 
-Search updates as you type. Results are virtualized and can be sorted by name, path, size, or modified time. Click a header again to reverse its sort. Filter by files, folders, audio, images, videos, or documents. Right-click a result for **Open**, **Show in Finder**, **Copy path**, and **Move to Trash**. The trash action uses macOS Trash so files and folders can be restored in Finder; failures appear in the search error area. Double-click or press Return to open the selected result with its default app; `⌘Return` reveals it in Finder and `⇧⌘C` copies its full path. `⌘F` focuses search, `↑`/`↓` select results, and `⌘R` rebuilds the index.
+Search updates as you type. Results are virtualized and can be sorted by name, path, size, or modified time. Click a header again to reverse its sort. Filter by files, folders, audio, images, videos, or documents. Right-click a result for **Open**, **Show in Finder**, **Get Info**, **Copy**, **Copy path**, **Rename…**, and **Move to Trash**. **Get Info** opens Finder’s information window and may request permission to control Finder. **Copy** puts the actual file or folder on the clipboard for pasting in Finder. **Rename…** edits its name in place and refuses to replace an existing item. The trash action uses macOS Trash so files and folders can be restored in Finder; failures appear in the search error area. Selecting a result moves keyboard focus from search to the file list. Press Space there to preview the selected result in the app’s native macOS Quick Look panel; Space or Escape closes the preview. Spaces still type normally in the search field. Double-click or press Return to open the selected result with its default app; `⌘Return` reveals it in Finder and `⇧⌘C` copies its full path. `⌘F` focuses search, `↑`/`↓` select results, and `⌘R` rebuilds the index.
 
 | Query | Meaning |
 | --- | --- |
@@ -57,7 +57,7 @@ Existing databases upgrade in place and need one verification scan to establish 
 
 The app’s own support directory is excluded to avoid a database write/update loop. Removing an indexed root prunes its saved entries. Database failures are shown in the status area; searches continue in memory, and an unrecognized or corrupt existing database is preserved.
 
-Folder settings and window geometry are stored alongside the database under `~/Library/Application Support/eveythingmac/`. Settings writes use a private temporary file and atomic rename. Invalid existing JSON is preserved and saving is disabled until fixed. Choosing folders and searching do not rename, delete, or upload your files. **Move to Trash** explicitly moves the chosen result to macOS Trash; it never permanently deletes a result. Opening a result hands it to the system's registered application.
+Folder settings and window geometry are stored alongside the database under `~/Library/Application Support/eveythingmac/`. Settings writes use a private temporary file and atomic rename. Invalid existing JSON is preserved and saving is disabled until fixed. Choosing folders and searching do not rename, delete, or upload your files. **Rename…** changes the chosen result’s name; if you rename an indexed root, update its path in **Indexed folders**. **Move to Trash** explicitly moves the chosen result to macOS Trash; it never permanently deletes a result. Opening a result hands it to the system's registered application.
 
 ## What was analyzed and what differs
 
@@ -69,7 +69,7 @@ This is a working core implementation, not full Everything feature parity:
 
 - SQLite persists the index between launches; searches still use an in-memory copy for speed. Normal folder restarts reconcile changed paths from volume history. Whole-disk trees and recovery scans can still take time and memory. There is no NTFS MFT/USN integration.
 - Only configured, accessible roots are indexed. Protected folders, offline volumes, and symlink targets can be absent. Rebuild retries watchers and rescans manually after roots are restored.
-- Bookmarks, search history, content/media/date predicates, duplicate finding, thumbnails, result export, HTTP/ETP servers, Windows services, multi-window mode, and file management operations beyond moving results to Trash are not implemented.
+- Bookmarks, search history, content/media/date predicates, duplicate finding, thumbnails, result export, HTTP/ETP servers, Windows services, multi-window mode, and file management operations beyond copying, renaming, and moving results to Trash are not implemented.
 - Wildcards match the whole filename (or whole path in path mode); Unicode case folding follows Rust regex. These semantics are tested locally, not compared to a running Windows instance. Non-UTF-8 filenames display with replacement characters, although the original path is retained for opening.
 
 ## Checks
