@@ -1,4 +1,5 @@
 mod bulk;
+mod content_search;
 mod file_actions;
 mod fs_events;
 mod index;

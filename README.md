@@ -49,6 +49,10 @@ The Size column and Size sorting use allocated bytes on disk, including sparse-f
 
 **Aa** enables case-sensitive matching; **Path** searches full paths. Queries containing `/` also match full paths. **Regex** interprets the entire query as a [Rust regular expression](https://docs.rs/regex/latest/regex/), rather than Everything operators. Invalid or unsupported predicates display an error. Size units use powers of 1024.
 
+**Content** switches to optional file-content search through macOS Spotlight (`mdfind`). Type text such as `annual report`, or use `*` / `?` wildcards; the entire query is a content pattern, matched case-insensitively unless **Aa** is enabled. Filename operators such as `ext:` and `size:` are not interpreted in this mode, and **Path** / **Regex** are disabled until you switch Content off. An empty content query shows no results. The file-type filters, sorting, selection, Quick Look, and file actions still work. Reset search also turns Content off.
+
+Content results are restricted to files already in the app's index, so configured folders and exclusions still apply. Spotlight must already have indexed their text: unsupported file types, Spotlight Privacy exclusions, disabled indexing, and recent edits can produce missing or delayed matches. There is no separate content index, file download, or upload; the app queries the existing local Spotlight store. Searches run in the background, cancel when superseded or the view closes, and report errors or a 15-second timeout. Repeating a query checks Spotlight again; the app does not subscribe to Spotlight index updates.
+
 Native macOS FSEvents tracks creates, renames, edits and removals. Ordinary directory metadata/data updates compare immediate children and scan only newly discovered subtrees. Existing descendants stay indexed. Creates, removals, renames and coalesced events rescan the affected subtree; lost events request a full rebuild. Initial and recovery scans use `getattrlistbulk` to fetch file metadata in batches, with normal filesystem reads as a fallback. A watcher failure is shown in the status area; use **Rebuild** to rescan manually.
 
 ## Access and saved data
@@ -73,7 +77,7 @@ This is a working core implementation, not full Everything feature parity:
 
 - SQLite persists the index between launches; searches still use an in-memory copy for speed. Normal folder restarts reconcile changed paths from volume history. Whole-disk trees and recovery scans can still take time and memory. There is no NTFS MFT/USN integration.
 - Only configured, accessible roots are indexed. Protected folders, offline volumes, and symlink targets can be absent. Rebuild retries watchers and rescans manually after roots are restored.
-- Bookmarks, search history, content/media/date predicates, duplicate finding, thumbnails, result export, HTTP/ETP servers, Windows services, multi-window mode, and file management operations beyond copying, renaming, and moving results to Trash are not implemented.
+- Bookmarks, search history, media/date predicates, duplicate finding, thumbnails, result export, HTTP/ETP servers, Windows services, multi-window mode, and file management operations beyond copying, renaming, and moving results to Trash are not implemented.
 - Wildcards match the whole filename (or whole path in path mode); Unicode case folding follows Rust regex. These semantics are tested locally, not compared to a running Windows instance. Non-UTF-8 filenames display with replacement characters, although the original path is retained for opening.
 
 ## Checks
@@ -84,4 +88,4 @@ cargo check --offline
 cargo fmt --all -- --check
 ```
 
-Tests cover query parsing and matching, metadata and symlink handling, live macOS create/rename/delete notifications, database round trips, offline changes across restarts, atomic checkpoint rollback, old-format rebuilds, unknown-format rejection, quiet reopens, multiple replay roots, history-loss recovery, native bulk metadata and malformed records, cache corruption handling, settings preservation, window geometry, and the integrated search UI.
+Tests cover content-query escaping, Spotlight output decoding/cancellation/errors, content-mode controls, query parsing and matching, metadata and symlink handling, live macOS create/rename/delete notifications, database round trips, offline changes across restarts, atomic checkpoint rollback, old-format rebuilds, unknown-format rejection, quiet reopens, multiple replay roots, history-loss recovery, native bulk metadata and malformed records, cache corruption handling, settings preservation, window geometry, and the integrated search UI.

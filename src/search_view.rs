@@ -1,4 +1,5 @@
 use crate::{
+    content_search,
     index::{Entry, Index, Snapshot},
     query::Query,
     settings::Settings,
@@ -55,6 +56,11 @@ enum Sort {
     Modified,
 }
 
+enum SearchQuery {
+    Filename(Query),
+    Content(Option<String>),
+}
+
 struct FilterResults {
     results: Arc<Vec<Arc<Entry>>>,
     selected: Option<usize>,
@@ -81,6 +87,7 @@ pub(crate) struct SearchView {
     case: bool,
     path: bool,
     regex: bool,
+    content: bool,
     filter: usize,
     filter_results: [Option<FilterResults>; 7],
     sort: Sort,
@@ -160,6 +167,7 @@ impl SearchView {
             case: false,
             path: false,
             regex: false,
+            content: false,
             filter: 0,
             filter_results: std::array::from_fn(|_| None),
             sort: Sort::Path,
@@ -210,12 +218,12 @@ impl SearchView {
             cx.notify();
             return;
         }
-        let query = Query::parse(
-            &self.input.read(cx).value(),
-            self.case,
-            self.path,
-            self.regex,
-        );
+        let text = self.input.read(cx).value();
+        let query = if self.content {
+            content_search::predicate(&text, self.case).map(SearchQuery::Content)
+        } else {
+            Query::parse(&text, self.case, self.path, self.regex).map(SearchQuery::Filename)
+        };
         let query = match query {
             Ok(query) => query,
             Err(error) => {
@@ -235,6 +243,7 @@ impl SearchView {
         let revision = self.snapshot.revision;
         let loaded = self.snapshot.loaded;
         let entries = self.snapshot.entries.clone();
+        let roots = self.roots.clone();
         let filter = self.filter;
         let sort = self.sort;
         let descending = self.descending;
@@ -249,25 +258,64 @@ impl SearchView {
             let result = cx
                 .background_spawn(async move {
                     if matching_generation.load(Ordering::Relaxed) != generation {
-                        return None;
+                        return Ok(None);
                     }
+                    let content_paths = match &query {
+                        // shortcut: Spotlight changes refresh on the next search; subscribe if live content updates are needed.
+                        SearchQuery::Content(predicate) => {
+                            match content_search::search(
+                                predicate.as_deref(),
+                                &roots,
+                                &matching_generation,
+                                generation,
+                            )? {
+                                Some(paths) => paths,
+                                None => return Ok(None),
+                            }
+                        }
+                        SearchQuery::Filename(_) => Default::default(),
+                    };
                     let mut results = Vec::new();
                     for (i, entry) in entries.iter().enumerate() {
                         if i % 1024 == 0
                             && matching_generation.load(Ordering::Relaxed) != generation
                         {
-                            return None;
+                            return Ok(None);
                         }
                         if kind_matches(entry, filter)
-                            && query.matches(&entry.path, entry.is_dir, entry.size)
+                            && match &query {
+                                SearchQuery::Filename(query) => {
+                                    query.matches(&entry.path, entry.is_dir, entry.size)
+                                }
+                                SearchQuery::Content(_) => {
+                                    !entry.is_dir && content_paths.contains(&entry.path)
+                                }
+                            }
                         {
                             results.push(entry.clone());
                         }
                     }
-                    Some(Arc::new(results))
+                    Ok::<_, String>(Some(Arc::new(results)))
                 })
                 .await;
-            let Some(mut results) = result else { return };
+            let mut results = match result {
+                Ok(Some(results)) => results,
+                Ok(None) => return,
+                Err(error) => {
+                    let _ = this.update_in(cx, |this, _, cx| {
+                        if this.generation.load(Ordering::Relaxed) != generation {
+                            return;
+                        }
+                        this.search_task = None;
+                        this.searching = false;
+                        this.starting = false;
+                        this.pending_open = None;
+                        this.error = Some(error);
+                        this.set_results(Arc::new(Vec::new()), cx, reveal_selection);
+                    });
+                    return;
+                }
+            };
             if (sort != Sort::Path || descending) && results.len() > 1 {
                 let published = this.update_in(cx, |this, _, cx| {
                     if this.generation.load(Ordering::Relaxed) != generation {
@@ -705,6 +753,12 @@ impl SearchView {
     }
 }
 
+impl Drop for SearchView {
+    fn drop(&mut self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 impl Render for SearchView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let startup_loading = self.starting.then(|| {
@@ -813,8 +867,18 @@ impl Render for SearchView {
         } else if self.searching {
             (
                 IconName::Search,
-                "Searching your index…",
+                if self.content {
+                    "Searching file contents…"
+                } else {
+                    "Searching your index…"
+                },
                 "Finding files and folders that match your search.",
+            )
+        } else if self.content {
+            (
+                IconName::SearchX,
+                "No content matches",
+                "Enter text to find inside files. Results depend on Spotlight indexing and may take time to appear.",
             )
         } else {
             (
@@ -833,9 +897,9 @@ impl Render for SearchView {
             .on_action(cx.listener(|this, _: &NextResult, window, cx| this.move_selection(1, false, window, cx)))
             .on_action(cx.listener(|this, _: &PreviousResult, window, cx| this.move_selection(-1, false, window, cx)))
             .on_action(cx.listener(|_, _: &SearchHelp, window, cx| crate::settings_view::show_error(
-                "Search filenames as you type.\n\nreport budget — both words\n\"annual report\" — exact phrase\n*.pdf | *.docx — either pattern\n!backup — exclude a word\n<cat | dog> photo — group terms\next:jpg;png — extension filter\nfile: / folder: — kind\npath:Projects — search full path\nsize:>10mb — size filter\n\nAa: case sensitive. Path: match full paths. Regex: treat the entire query as a regular expression.\n\n⌘-click Toggle selection · Shift-click Select range · ⌘A Select all · ⇧↑/↓ Extend selection · ⌘C Copy files · ⌘⌫ Move to Trash\n\n⌘F Search · ↓/↑ Select · Space Quick Look · Return Open · ⌘Return Reveal · ⇧⌘C Copy path · ⌘R Rebuild · ⌘, Folders".into(), window, cx)))
+                "Search filenames as you type.\n\nreport budget — both words\n\"annual report\" — exact phrase\n*.pdf | *.docx — either pattern\n!backup — exclude a word\n<cat | dog> photo — group terms\next:jpg;png — extension filter\nfile: / folder: — kind\npath:Projects — search full path\nsize:>10mb — size filter\n\nAa: case sensitive. Path: match full paths. Regex: treat the entire query as a regular expression.\n\nContent: search text inside files using Spotlight. Type text or * / ? wildcards; the whole query is a content pattern. Aa controls case. Path, Regex and filename operators apply only to filename search. Results are limited to indexed files; Spotlight coverage and updates may lag.\n\n⌘-click Toggle selection · Shift-click Select range · ⌘A Select all · ⇧↑/↓ Extend selection · ⌘C Copy files · ⌘⌫ Move to Trash\n\n⌘F Search · ↓/↑ Select · Space Quick Look · Return Open · ⌘Return Reveal · ⇧⌘C Copy path · ⌘R Rebuild · ⌘, Folders".into(), window, cx)))
             .child(div().flex().items_center().gap_2().px_5().pt_4().pb_3()
-                .child(div().flex_1().min_w_0().child(Input::new(&self.input).id("search-input").aria_label("Search files and folders")
+                .child(div().flex_1().min_w_0().child(Input::new(&self.input).id("search-input").aria_label(if self.content { "Search file contents" } else { "Search files and folders" })
                 .prefix(Icon::new(IconName::Search).small().text_color(cx.theme().muted_foreground))
                 .suffix(div().text_xs().text_color(cx.theme().muted_foreground).child("⌘ F"))
                 .cleanable(true)))
@@ -850,9 +914,11 @@ impl Render for SearchView {
                         .on_click(cx.listener(move |this, _, window, cx| this.change_filter(filter, window, cx)))
                 })))
                 .child(div().flex().items_center().gap_1()
-                    .child(Button::new("case").ghost().small().label("Aa").tooltip("Case sensitive").selected(self.case).when(self.case, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.case = !this.case; this.search(window, cx, true); })))
-                    .child(Button::new("path").ghost().small().label("Path").tooltip("Search full paths").selected(self.path).when(self.path, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.path = !this.path; this.search(window, cx, true); })))
-                    .child(Button::new("regex").ghost().small().label("Regex").tooltip("Use a regular expression").selected(self.regex).when(self.regex, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.regex = !this.regex; this.search(window, cx, true); })))))
+                    .child(Button::new("content").ghost().small().label("Content").tooltip("Search inside files using Spotlight").selected(self.content).toggled(self.content).when(self.content, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.content = !this.content; this.search(window, cx, true); })))
+                    .child(Button::new("case").ghost().small().label("Aa").tooltip("Case sensitive").selected(self.case).toggled(self.case).when(self.case, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.case = !this.case; this.search(window, cx, true); })))
+                    .child(Button::new("path").ghost().small().label("Path").tooltip("Search full paths (filename search only)").disabled(self.content).selected(self.path).toggled(self.path).when(self.path, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.path = !this.path; this.search(window, cx, true); })))
+                    .child(Button::new("regex").ghost().small().label("Regex").tooltip("Use a regular expression (filename search only)").disabled(self.content).selected(self.regex).toggled(self.regex).when(self.regex, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.regex = !this.regex; this.search(window, cx, true); })))))
+            .when(self.content, |this| this.child(div().id("content-search-note").test_support().role(Role::Status).aria_label("Content search uses Spotlight").mx_5().mb_3().text_xs().text_color(cx.theme().muted_foreground).child("Search inside files: text or * / ? wildcards. Spotlight may omit unindexed files or recent edits.")))
             .children(self.error.clone().map(|error| div().id("search-error").test_support().role(Role::Status).aria_label(error.clone())
                 .mx_5().mb_3().px_3().py_2().rounded_md().bg(cx.theme().danger.opacity(0.08)).flex().items_center().gap_2().text_sm().text_color(cx.theme().danger)
                 .child(Icon::new(IconName::CircleAlert).small().flex_shrink_0()).child(div().flex_1().min_w_0().child(error))))
@@ -958,6 +1024,7 @@ impl Render for SearchView {
                             this.case = false;
                             this.path = false;
                             this.regex = false;
+                            this.content = false;
                             this.input.update(cx, |input, cx| { input.set_value("", window, cx); input.focus(window, cx); });
                             this.search(window, cx, true);
                         })))))))

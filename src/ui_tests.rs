@@ -474,6 +474,79 @@ async fn search_filters_invalid_queries_latest_input_and_keyboard_selection(
 }
 
 #[gpui_kit::test]
+async fn content_mode_is_opt_in_and_restores_filename_controls(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    cx.update_window(handle, |_, window, cx| {
+        assert_ne!(window.find("content").checked(), Some(true));
+        window.click("path", cx);
+        window.click("regex", cx);
+        window.click("content", cx);
+        assert_eq!(window.find("content").checked(), Some(true));
+        window.click("path", cx);
+        window.click("regex", cx);
+        assert_eq!(window.find("path").checked(), Some(true));
+        assert_eq!(window.find("regex").checked(), Some(true));
+        assert_eq!(
+            window.find("search-input").label(),
+            Some("Search file contents")
+        );
+        assert!(window.find("content-search-note").visible());
+    })
+    .unwrap();
+    wait_count(cx, handle, 0).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click("search-input", cx);
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("x".repeat(4097)));
+        window.press("cmd-v", cx);
+    })
+    .unwrap();
+    cx.wait_for(handle, Duration::from_secs(3), |window, _| {
+        window.try_find("search-error").is_some()
+    })
+    .await;
+    cx.update_window(handle, |_, window, cx| {
+        assert!(
+            window
+                .find("search-error")
+                .label()
+                .unwrap()
+                .contains("4096")
+        );
+        type_query(window, cx, "alpha.*");
+        window.click("content", cx);
+        assert_ne!(window.find("path").disabled(), Some(true));
+        assert_ne!(window.find("regex").disabled(), Some(true));
+        assert_eq!(window.find("path").checked(), Some(true));
+        assert_eq!(window.find("regex").checked(), Some(true));
+        assert!(window.try_find("content-search-note").is_none());
+    })
+    .unwrap();
+    wait_count(cx, handle, 2).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click("content", cx);
+        type_query(window, cx, "");
+    })
+    .unwrap();
+    wait_count(cx, handle, 0).await;
+    cx.wait_for(handle, Duration::from_secs(3), |window, _| {
+        window.try_find("reset-search").is_some()
+    })
+    .await;
+    cx.update_window(handle, |_, window, cx| window.click("reset-search", cx))
+        .unwrap();
+    wait_count(cx, handle, 6).await;
+    cx.update_window(handle, |_, window, _| {
+        assert_ne!(window.find("content").checked(), Some(true));
+        assert_ne!(window.find("path").checked(), Some(true));
+        assert_ne!(window.find("regex").checked(), Some(true));
+        assert!(window.try_find("search-error").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 async fn indexed_folder_changes_cancel_or_persist_on_save(cx: &mut TestAppContext) {
     let fixture = Fixture::new();
     let handle = fixture.open(cx);
