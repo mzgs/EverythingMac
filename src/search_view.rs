@@ -354,20 +354,6 @@ impl Render for SearchView {
         let selected = self.selected;
         let owner = cx.entity().downgrade();
         let no_results = self.results.is_empty();
-        let index_status = if self.snapshot.scanning {
-            "Updating index…"
-        } else if self.snapshot.warning.is_some() || self.snapshot.skipped > 0 {
-            "Index needs attention"
-        } else if self.roots.is_empty() {
-            "No folders indexed"
-        } else {
-            "Index up to date"
-        };
-        let displayed_status = if self.searching {
-            "Searching…"
-        } else {
-            index_status
-        };
         let (empty_icon, empty_title, empty_description) = if self.roots.is_empty() {
             (
                 IconName::FolderPlus,
@@ -420,7 +406,10 @@ impl Render for SearchView {
                 .child(div().flex().items_center().gap_2()
                     .child(Button::new("folders").icon(IconName::FolderCog).label("Indexed folders").tooltip("Choose folders to search · ⌘,").on_click(|_, window, cx| window.dispatch_action(Box::new(crate::OpenSettings), cx)))
                     .child(Button::new("rebuild").ghost().icon(IconName::RefreshCw).label("Rebuild").tooltip("Rescan indexed folders · ⌘R").disabled(self.snapshot.scanning).on_click(cx.listener(|this, _, _, cx| { this.index.refresh(); cx.notify(); })))
-                    .child(Button::new("help").ghost().icon(IconName::CircleQuestionMark).accessibility_label("Search help").tooltip("Search syntax and keyboard shortcuts").on_click(|_, window, cx| window.dispatch_action(Box::new(SearchHelp), cx)))))
+                    .child(Button::new("help").ghost().icon(IconName::CircleQuestionMark).accessibility_label("Search help").tooltip("Search syntax and keyboard shortcuts").on_click(|_, window, cx| window.dispatch_action(Box::new(SearchHelp), cx)))
+                    .child(Button::new("full-disk-access").ghost().icon(IconName::TriangleAlert).accessibility_label("Needs Full Disk Access")
+                        .tooltip(self.snapshot.scan_warning.clone().unwrap_or_else(|| "Open Full Disk Access in System Settings".into()))
+                        .on_click(|_, _, cx| cx.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")))))
             .child(div().px_5().pb_3().child(Input::new(&self.input).id("search-input").aria_label("Search files and folders").large()
                 .prefix(Icon::new(IconName::Search).small().text_color(cx.theme().muted_foreground))
                 .suffix(div().text_xs().text_color(cx.theme().muted_foreground).child("⌘ F"))
@@ -445,10 +434,7 @@ impl Render for SearchView {
                 .child(div().flex().items_center().gap_2()
                     .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Results"))
                     .child(div().id("result-count").test_support().role(Role::Status).aria_label(format!("{} matches", self.results.len()))
-                        .text_xs().text_color(cx.theme().muted_foreground).child(format!("{} matches", format_count(self.results.len())))))
-                .child(div().id("index-status").test_support().role(Role::Status).aria_label(displayed_status).flex().items_center().gap_2().text_xs().text_color(cx.theme().muted_foreground)
-                    .child(Icon::new(if self.snapshot.scanning { IconName::LoaderCircle } else if self.snapshot.warning.is_some() || self.snapshot.skipped > 0 { IconName::TriangleAlert } else { IconName::HardDrive }).xsmall())
-                    .child(displayed_status)))
+                        .text_xs().text_color(cx.theme().muted_foreground).child(format!("{} matches", format_count(self.results.len()))))))
             .child(div().flex().items_center().px_5().border_y_1().border_color(cx.theme().border).bg(cx.theme().muted.opacity(0.4)).text_color(cx.theme().muted_foreground)
                 .child(self.heading("Name", Sort::Name, 280., cx))
                 .child(div().flex_1().min_w_0().child(self.heading("Path", Sort::Path, 140., cx)))
@@ -508,8 +494,7 @@ impl Render for SearchView {
                 .child(Button::new("copy-path").ghost().small().icon(IconName::Copy).label("Copy path").tooltip("Copy full path · ⇧⌘C").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, _, cx| this.copy(cx))))
                 .child(div().flex_1())
                 .child(div().text_xs().text_color(cx.theme().muted_foreground).child("↑ ↓ Navigate    ↵ Open    ⌘ ↵ Reveal")))
-            .children(self.snapshot.warning.clone().map(|warning| div().id("index-warnings").max_h(px(80.)).overflow_y_scroll().px_5().pb_2().text_xs().text_color(cx.theme().muted_foreground).child(warning)))
-            .when(self.snapshot.skipped > 0, |this| this.child(div().px_5().pb_2().text_xs().text_color(cx.theme().muted_foreground).child(format!("{} paths could not be read. Check folder permissions or grant Full Disk Access, then rebuild.", self.snapshot.skipped))))
+            .children(self.snapshot.warning.clone().map(|warning| div().id("index-warnings").test_support().role(Role::Status).aria_label(warning.clone()).max_h(px(80.)).overflow_y_scroll().px_5().pb_2().text_xs().text_color(cx.theme().muted_foreground).child(warning)))
     }
 }
 
@@ -597,6 +582,57 @@ mod tests {
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AppContext, ScrollStrategy, TestAppContext};
     use std::{path::PathBuf, sync::Arc};
+
+    #[gpui_kit::test]
+    fn access_icon_stays_in_header_and_opens_full_disk_access(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_global(Settings { roots: Vec::new() }));
+        let (window, view) = cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                window.set_scroll_layers(false);
+                cx.new(|cx| SearchView::new(None, window, cx))
+            })
+            .unwrap()
+        });
+        for active in [true, false] {
+            cx.update(|cx| {
+                view.update(cx, |view, cx| {
+                    view._poll = gpui_kit::Task::ready(());
+                    view.search_task = None;
+                    view.searching = active;
+                    view.snapshot.scanning = active;
+                    view.snapshot.skipped = if active { 111 } else { 0 };
+                    view.snapshot.scan_warning = active.then(|| "111 inaccessible paths".into());
+                    view.snapshot.warning = Some("Index database unavailable".into());
+                    cx.notify();
+                });
+            });
+            cx.update_window(window.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.try_find("index-status").is_none());
+                assert_eq!(
+                    window.find("full-disk-access").label(),
+                    Some("Needs Full Disk Access")
+                );
+                assert_eq!(
+                    window.find("index-warnings").label(),
+                    Some("Index database unavailable")
+                );
+            })
+            .unwrap();
+        }
+        cx.update_window(window.into(), |_, window, cx| {
+            window.click("full-disk-access", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("dialog").is_none());
+        })
+        .unwrap();
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+        );
+    }
 
     #[gpui_kit::test]
     async fn background_refresh_preserves_scroll_and_sorting_goes_to_top(cx: &mut TestAppContext) {

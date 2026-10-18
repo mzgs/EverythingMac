@@ -115,7 +115,7 @@ impl Database {
         db
     }
 
-    pub(crate) fn load(&mut self, roots: &[PathBuf]) -> Entries {
+    pub(crate) fn load(&mut self, roots: &[PathBuf], mut preview: impl FnMut(&Entries)) -> Entries {
         let Some(connection) = &self.connection else {
             return Entries::new();
         };
@@ -162,6 +162,10 @@ impl Database {
                         modified,
                     }),
                 );
+                // Show a small cached list while the rest of a large index loads.
+                if entries.len() == 1024 {
+                    preview(&entries);
+                }
             }
             Ok(entries)
         })();

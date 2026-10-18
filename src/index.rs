@@ -28,6 +28,7 @@ pub struct Snapshot {
     pub entries: Arc<Vec<Arc<Entry>>>,
     pub scanning: bool,
     pub skipped: usize,
+    pub scan_warning: Option<String>,
     pub warning: Option<String>,
     pub revision: u64,
     #[cfg(test)]
@@ -80,6 +81,7 @@ impl Index {
             entries: Arc::new(Vec::new()),
             scanning: true,
             skipped: 0,
+            scan_warning: None,
             warning: None,
             revision: 0,
             #[cfg(test)]
@@ -138,7 +140,9 @@ fn run(
     event_sender: Sender<Message>,
 ) {
     let mut database = Database::open(database_path.as_deref());
-    let mut entries = database.load(&roots);
+    let mut entries = database.load(&roots, |entries| {
+        publish(&snapshot, entries, &Errors::new(), &None, &None, true);
+    });
     let mut plan = fs_events::Plan::new(&roots);
     let mut identity = plan.as_ref().map(|plan| plan.identities.clone());
     let baseline = plan
@@ -701,19 +705,16 @@ fn publish(
             path.display()
         )
     });
-    let warnings: Vec<_> = [
-        watch_warning.clone(),
-        database_warning.clone(),
-        scan_warning,
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let warnings: Vec<_> = [watch_warning.clone(), database_warning.clone()]
+        .into_iter()
+        .flatten()
+        .collect();
     let warning = (!warnings.is_empty()).then(|| warnings.join("\n"));
     let mut snapshot = snapshot.write().unwrap();
     snapshot.entries = Arc::new(entries.values().cloned().collect());
     snapshot.scanning = scanning;
     snapshot.skipped = errors.len();
+    snapshot.scan_warning = scan_warning;
     snapshot.warning = warning;
     snapshot.revision += 1;
 }
@@ -1007,7 +1008,7 @@ mod tests {
         let index = Index::start(vec![root.0.join("missing")], None);
         let snapshot = wait_for(&index, |_| true);
         assert_eq!(snapshot.skipped, 1);
-        assert!(snapshot.warning.is_some());
+        assert!(snapshot.scan_warning.is_some());
     }
 }
 
@@ -1044,6 +1045,71 @@ mod persistence_tests {
     }
 
     #[test]
+    fn large_cache_previews_before_loading_finishes_and_preserves_corrupt_data() {
+        let fixture = fixture();
+        let root = fixture.join("files");
+        let path = fixture.join("cache/index.sqlite3");
+        let mut database = Database::open(Some(&path));
+        let entries: Entries = (0..1025)
+            .map(|i| {
+                let path = root.join(format!("file-{i:04}"));
+                let entry = Arc::new(Entry {
+                    path: path.clone(),
+                    is_dir: false,
+                    size: i,
+                    modified: None,
+                });
+                (path, entry)
+            })
+            .collect();
+        database.save(
+            &entries,
+            &entries.keys().cloned().collect(),
+            &AtomicBool::new(false),
+        );
+        assert!(database.warning.is_none());
+        let mut previews = Vec::new();
+        let loaded = database.load(&[root.clone()], |preview| {
+            previews.push(preview.len());
+            assert!(
+                preview
+                    .iter()
+                    .all(|(path, entry)| entries.get(path) == Some(entry))
+            );
+        });
+        assert_eq!(previews, [1024]);
+        assert_eq!(loaded, entries);
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE files SET metadata = ?1 WHERE path = ?2",
+                rusqlite::params![
+                    b"invalid".as_slice(),
+                    root.join("file-1024").as_os_str().as_bytes()
+                ],
+            )
+            .unwrap();
+        previews.clear();
+        let loaded = database.load(&[root], |preview| previews.push(preview.len()));
+        assert_eq!(previews, [1024]);
+        assert!(loaded.is_empty(), "A corrupt load must discard the preview");
+        assert!(database.warning.is_some());
+        database.save(
+            &Entries::new(),
+            &entries.keys().cloned().collect(),
+            &AtomicBool::new(false),
+        );
+        let rows: i64 = connection
+            .query_row("SELECT count(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1025, "Corrupt cache must remain untouched");
+        drop(database);
+        drop(connection);
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
     fn database_survives_restart_reconciles_offline_changes_and_saves_live_updates() {
         let fixture = fixture();
         let root = fixture.join("files");
@@ -1059,13 +1125,13 @@ mod persistence_tests {
             0o600
         );
         let mut db = Database::open(Some(&db_path));
-        assert_eq!(db.load(&[root.clone()]).len(), 3);
+        assert_eq!(db.load(&[root.clone()], |_| {}).len(), 3);
         drop(index);
         fs::rename(root.join("old.txt"), root.join("renamed.txt")).unwrap();
         fs::write(root.join("edited.txt"), "updated while closed").unwrap();
         fs::write(root.join("new.txt"), "new").unwrap();
         // A cache read returns the saved snapshot before filesystem reconciliation.
-        let cached = db.load(&[root.clone()]);
+        let cached = db.load(&[root.clone()], |_| {});
         assert!(cached.contains_key(&root.join("old.txt")));
         assert!(!cached.contains_key(&root.join("new.txt")));
         let index = Index::start(vec![root.clone()], Some(db_path.clone()));
@@ -1079,7 +1145,7 @@ mod persistence_tests {
             replayed.replayed,
             "A valid cache must select historical replay; native history-loss flags may still request recovery"
         );
-        let stored = db.load(&[root.clone()]);
+        let stored = db.load(&[root.clone()], |_| {});
         assert!(stored.contains_key(&root.join("renamed.txt")));
         assert!(stored.contains_key(&root.join("new.txt")));
         assert!(!stored.contains_key(&root.join("old.txt")));
@@ -1088,12 +1154,15 @@ mod persistence_tests {
         wait(&index, |s| {
             !s.entries.iter().any(|e| e.path == root.join("new.txt"))
         });
-        assert!(!db.load(&[root.clone()]).contains_key(&root.join("new.txt")));
+        assert!(
+            !db.load(&[root.clone()], |_| {})
+                .contains_key(&root.join("new.txt"))
+        );
         drop(index);
         let index = Index::start(Vec::new(), Some(db_path.clone()));
         wait(&index, |s| s.entries.is_empty());
         assert!(
-            db.load(&[root]).is_empty(),
+            db.load(&[root], |_| {}).is_empty(),
             "Removed roots must be pruned from disk"
         );
         drop(index);
@@ -1130,7 +1199,7 @@ mod persistence_tests {
         drop(index);
         // macOS can return zero before its history has been flushed; replay from zero is safe.
         let mut database = Database::open(Some(&path));
-        let cached = database.load(&roots);
+        let cached = database.load(&roots, |_| {});
         database.checkpoint.as_mut().unwrap().event_ids.fill(0);
         database.save(&cached, &BTreeSet::new(), &AtomicBool::new(false));
         assert!(database.warning.is_none());
@@ -1187,7 +1256,7 @@ mod persistence_tests {
         db.save(&entries, &changed, &stopped);
         assert_eq!(Database::open(Some(&path)).checkpoint, db.checkpoint);
         assert!(db.warning.is_none(), "{:?}", db.warning);
-        assert_eq!(db.load(&[fixture.clone()])[&raw], entry);
+        assert_eq!(db.load(&[fixture.clone()], |_| {})[&raw], entry);
         entries.clear();
         stopped.store(true, Ordering::Relaxed);
         db.checkpoint.as_mut().unwrap().event_ids = vec![2];
@@ -1199,13 +1268,13 @@ mod persistence_tests {
             "Rows and cursor must roll back together"
         );
         assert!(
-            db.load(&[fixture.clone()]).contains_key(&raw),
+            db.load(&[fixture.clone()], |_| {}).contains_key(&raw),
             "Cancelled transaction must preserve previous snapshot"
         );
         stopped.store(false, Ordering::Relaxed);
         db.save(&entries, &BTreeSet::new(), &stopped);
         assert!(
-            db.load(&[fixture.clone()]).is_empty(),
+            db.load(&[fixture.clone()], |_| {}).is_empty(),
             "Failed writes must be retried"
         );
         assert_eq!(
@@ -1242,7 +1311,7 @@ mod persistence_tests {
         drop(index);
         let mut database = Database::open(Some(&path));
         assert!(database.warning.is_none(), "{:?}", database.warning);
-        assert_eq!(database.load(&[root.clone()]).len(), 2);
+        assert_eq!(database.load(&[root.clone()], |_| {}).len(), 2);
         assert!(database.checkpoint.is_none());
         drop(database);
         fs::write(root.join("new"), b"new").unwrap();
