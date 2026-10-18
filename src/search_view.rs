@@ -405,15 +405,7 @@ impl Render for SearchView {
             .on_action(cx.listener(|this, _: &PreviousResult, _, cx| this.move_selection(-1, cx)))
             .on_action(cx.listener(|_, _: &SearchHelp, window, cx| crate::settings_view::show_error(
                 "Search filenames as you type.\n\nreport budget — both words\n\"annual report\" — exact phrase\n*.pdf | *.docx — either pattern\n!backup — exclude a word\n<cat | dog> photo — group terms\next:jpg;png — extension filter\nfile: / folder: — kind\npath:Projects — search full path\nsize:>10mb — size filter\n\nAa: case sensitive. Path: match full paths. Regex: treat the entire query as a regular expression.\n\n⌘F Search · ↓/↑ Select · Return Open · ⌘Return Reveal · ⇧⌘C Copy path · ⌘R Rebuild · ⌘, Folders".into(), window, cx)))
-            .child(div().flex().items_center().justify_between().px_5().pt_4().pb_3()
-                .child(div().flex().items_center().gap_3()
-                    .child(div().flex().items_center().justify_center().size_9().rounded_lg().bg(cx.theme().link.opacity(0.12))
-                        .child(Icon::new(IconName::Search).size_5().text_color(cx.theme().link)))
-                    .child(div().flex().flex_col().gap_1()
-                        .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Everything Mac"))
-                        .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Your files, a few keystrokes away."))))
-                .child(Button::new("folders").icon(IconName::FolderCog).label("Indexed folders").tooltip("Choose folders to search · ⌘,").on_click(|_, window, cx| window.dispatch_action(Box::new(crate::OpenSettings), cx))))
-            .child(div().flex().items_center().gap_2().px_5().pb_3()
+            .child(div().flex().items_center().gap_2().px_5().pt_4().pb_3()
                 .child(div().flex_1().min_w_0().child(Input::new(&self.input).id("search-input").aria_label("Search files and folders")
                 .prefix(Icon::new(IconName::Search).small().text_color(cx.theme().muted_foreground))
                 .suffix(div().text_xs().text_color(cx.theme().muted_foreground).child("⌘ F"))
@@ -435,11 +427,6 @@ impl Render for SearchView {
             .children(self.error.clone().map(|error| div().id("search-error").test_support().role(Role::Status).aria_label(error.clone())
                 .mx_5().mb_3().px_3().py_2().rounded_md().bg(cx.theme().danger.opacity(0.08)).flex().items_center().gap_2().text_sm().text_color(cx.theme().danger)
                 .child(Icon::new(IconName::CircleAlert).small().flex_shrink_0()).child(div().flex_1().min_w_0().child(error))))
-            .child(div().flex().items_center().justify_between().px_5().py_2().border_t_1().border_color(cx.theme().border).bg(cx.theme().table)
-                .child(div().flex().items_center().gap_2()
-                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Results"))
-                    .child(div().id("result-count").test_support().role(Role::Status).aria_label(format!("{} matches", self.results.len()))
-                        .text_xs().text_color(cx.theme().muted_foreground).child(format!("{} matches", format_count(self.results.len()))))))
             .child(div().flex().items_center().px_5().border_y_1().border_color(cx.theme().border).bg(cx.theme().muted).text_color(cx.theme().muted_foreground)
                 .child(self.heading("Name", Sort::Name, 280., cx))
                 .child(div().flex_1().min_w_0().child(self.heading("Path", Sort::Path, 140., cx)))
@@ -494,14 +481,17 @@ impl Render for SearchView {
                             this.search(window, cx, true);
                         })))))))
             .child(div().flex().items_center().gap_2().px_5().py_3().border_t_1().border_color(cx.theme().border).bg(cx.theme().status_bar)
+                .child(div().flex().flex_1().items_center().gap_2()
                 .child(Button::new("open").primary().small().icon(IconName::ExternalLink).label("Open").tooltip("Open selected result · Return").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.open(false, window, cx))))
                 .child(Button::new("reveal").ghost().small().icon(IconName::FolderOpen).label("Show in Finder").tooltip("Reveal selected result · ⌘Return").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.open(true, window, cx))))
-                .child(Button::new("copy-path").ghost().small().icon(IconName::Copy).label("Copy path").tooltip("Copy full path · ⇧⌘C").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, _, cx| this.copy(cx))))
-                .child(div().flex_1())
+                .child(Button::new("copy-path").ghost().small().icon(IconName::Copy).label("Copy path").tooltip("Copy full path · ⇧⌘C").disabled(self.selected.is_none()).on_click(cx.listener(|this, _, _, cx| this.copy(cx)))))
+                .child(div().id("result-count").test_support().role(Role::Status).aria_label(format!("{} matches", self.results.len()))
+                    .flex_shrink_0().text_xs().text_color(cx.theme().muted_foreground).child(format!("{} matches", format_count(self.results.len()))))
+                .child(div().flex().flex_1().items_center().justify_end().gap_2()
                 .child(Button::new("full-disk-access").ghost().small().icon(IconName::TriangleAlert).accessibility_label("Needs Full Disk Access")
                     .tooltip(self.snapshot.scan_warning.clone().unwrap_or_else(|| "Open Full Disk Access in System Settings".into()))
                     .on_click(|_, _, cx| cx.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")))
-                .child(div().id("navigation-hints").test_support().text_xs().text_color(cx.theme().muted_foreground).child("↑ ↓ Navigate    ↵ Open    ⌘ ↵ Reveal")))
+                .child(div().id("navigation-hints").test_support().text_xs().text_color(cx.theme().muted_foreground).child("↑ ↓ Navigate    ↵ Open    ⌘ ↵ Reveal"))))
             .children(self.snapshot.warning.clone().map(|warning| div().id("index-warnings").test_support().role(Role::Status).aria_label(warning.clone()).max_h(px(80.)).overflow_y_scroll().px_5().pb_2().bg(cx.theme().status_bar).text_xs().text_color(cx.theme().muted_foreground).child(warning)))
     }
 }
@@ -621,7 +611,8 @@ mod tests {
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
             assert!(window.try_find("rebuild").is_none());
-            window.click("folders", cx);
+            assert!(window.try_find("folders").is_none());
+            window.dispatch_action(Box::new(crate::OpenSettings), cx);
         })
         .unwrap();
         cx.wait_for(handle, std::time::Duration::from_secs(3), |window, _| {

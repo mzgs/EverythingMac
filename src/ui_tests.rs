@@ -192,6 +192,10 @@ async fn search_filters_invalid_queries_latest_input_and_keyboard_selection(
     wait_count(cx, handle, 2).await;
     cx.update_window(handle, |_, window, cx| {
         assert_eq!(window.find("result-count").label(), Some("2 matches"));
+        let summary = window.find("result-count").bounds();
+        let table = window.find("results-table").bounds();
+        assert!((summary.center().x - table.center().x).abs() < px(1.));
+        assert!(summary.origin.y >= table.bottom());
         assert_eq!(window.find(("result", 0usize)).selected(), Some(true));
         window.press("down", cx);
         assert_eq!(window.find(("result", 1usize)).selected(), Some(true));
