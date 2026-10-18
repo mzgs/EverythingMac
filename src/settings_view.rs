@@ -160,7 +160,7 @@ impl Render for FolderSettings {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div().flex().flex_col().gap_4()
             .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                .child("Choose where Everything Mac searches. Subfolders and hidden files are included; symbolic links aren’t followed."))
+                .child("Choose where Everything Mac searches. Subfolders and hidden files are included. Cloud storage folders are skipped; symbolic links aren’t followed."))
             .child(div().id("folder-list").max_h(px(300.)).overflow_y_scroll().border_1().border_color(cx.theme().border).rounded_lg().bg(cx.theme().muted)
                 .when(self.roots.is_empty(), |this| this.child(div().id("no-indexed-folders").test_support().flex().flex_col().items_center().gap_2().py_5()
                     .child(Icon::new(IconName::FolderPlus).size_6().text_color(cx.theme().muted_foreground))

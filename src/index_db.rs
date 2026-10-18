@@ -18,7 +18,7 @@ use std::{
 };
 
 type Entries = BTreeMap<PathBuf, Arc<Entry>>;
-type Metadata = (bool, u64, Option<(bool, u64, u32)>);
+type Metadata = (bool, u64, Option<(bool, u64, u32)>, u64);
 const APPLICATION_ID: i64 = 0x45564d43;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -81,17 +81,13 @@ impl Database {
                 }
                 let transaction = connection.transaction()?;
                 transaction.execute_batch("CREATE TABLE files (path BLOB PRIMARY KEY NOT NULL, metadata BLOB NOT NULL) WITHOUT ROWID;
-                    PRAGMA application_id = 1163283779; PRAGMA user_version = 1;")?;
+                    CREATE TABLE state (key TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL) WITHOUT ROWID;
+                    PRAGMA application_id = 1163283779; PRAGMA user_version = 3;")?;
                 transaction.commit()?;
-            } else if application_id != APPLICATION_ID || !matches!(version, 1 | 2) {
+            } else if application_id != APPLICATION_ID || version != 3 {
                 return Err(
                     "Unsupported index database version; existing file was preserved".into(),
                 );
-            }
-            if version < 2 {
-                let transaction = connection.transaction()?;
-                transaction.execute_batch("CREATE TABLE state (key TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL) WITHOUT ROWID; PRAGMA user_version = 2;")?;
-                transaction.commit()?;
             }
             let saved: Option<Vec<u8>> = connection
                 .query_row(
@@ -115,7 +111,7 @@ impl Database {
         db
     }
 
-    pub(crate) fn load(&mut self, roots: &[PathBuf], mut preview: impl FnMut(&Entries)) -> Entries {
+    pub(crate) fn load(&mut self, roots: &[PathBuf]) -> Entries {
         let Some(connection) = &self.connection else {
             return Entries::new();
         };
@@ -129,6 +125,7 @@ impl Database {
                     return Err("Invalid cached path".into());
                 }
                 if !roots.iter().any(|root| path.starts_with(root))
+                    || crate::index::is_cloud_path(&path)
                     || self
                         .excluded
                         .as_ref()
@@ -137,7 +134,7 @@ impl Database {
                     self.pending.insert(path);
                     continue;
                 }
-                let (is_dir, size, modified): Metadata =
+                let (is_dir, size, modified, allocated_size): Metadata =
                     serde_json::from_slice(&row.get::<_, Vec<u8>>(1)?)?;
                 let modified = modified
                     .map(|(before_epoch, seconds, nanos)| {
@@ -159,13 +156,10 @@ impl Database {
                         path,
                         is_dir,
                         size,
+                        allocated_size,
                         modified,
                     }),
                 );
-                // Show a small cached list while the rest of a large index loads.
-                if entries.len() == 1024 {
-                    preview(&entries);
-                }
             }
             Ok(entries)
         })();
@@ -216,7 +210,12 @@ impl Database {
                                         error.duration().subsec_nanos(),
                                     ),
                                 });
-                        let metadata = serde_json::to_vec(&(entry.is_dir, entry.size, modified))?;
+                        let metadata = serde_json::to_vec(&(
+                            entry.is_dir,
+                            entry.size,
+                            modified,
+                            entry.allocated_size,
+                        ))?;
                         upsert.execute(params![path.as_os_str().as_bytes(), metadata])?;
                     } else {
                         delete.execute([path.as_os_str().as_bytes()])?;

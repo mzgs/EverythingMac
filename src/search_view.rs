@@ -11,6 +11,7 @@ use gpui_kit::{
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState},
         menu::{ContextMenuExt, PopupMenuItem},
+        progress::Progress,
         scroll::Scrollbar,
     },
     *,
@@ -65,12 +66,14 @@ pub(crate) struct SearchView {
     sort: Sort,
     descending: bool,
     searching: bool,
+    starting: bool,
     pending_open: Option<bool>,
     error: Option<String>,
     generation: Arc<AtomicU64>,
     _subscription: Subscription,
     _poll: Task<()>,
     search_task: Option<Task<()>>,
+    pending_search: Option<bool>,
 }
 
 impl SearchView {
@@ -80,6 +83,7 @@ impl SearchView {
         cx: &mut Context<Self>,
     ) -> Self {
         let roots = cx.global::<Settings>().roots.clone();
+        let starting = !roots.is_empty();
         let index = Index::start(roots.clone(), database_path.clone());
         let snapshot = index.snapshot();
         let input =
@@ -107,10 +111,7 @@ impl SearchView {
                             this.search(window, cx, true);
                         }
                         let snapshot = this.index.snapshot();
-                        if snapshot.revision != this.snapshot.revision {
-                            this.snapshot = snapshot;
-                            this.search(window, cx, false);
-                        }
+                        this.update_snapshot(snapshot, window, cx);
                         cx.notify();
                     })
                     .is_err()
@@ -134,15 +135,17 @@ impl SearchView {
             path: false,
             regex: false,
             filter: 0,
-            sort: Sort::Name,
+            sort: Sort::Path,
             descending: false,
             searching: false,
+            starting,
             pending_open: None,
             error: None,
             generation: Arc::new(AtomicU64::new(0)),
             _subscription: subscription,
             _poll: poll,
             search_task: None,
+            pending_search: None,
         };
         view.search(window, cx, true);
         view
@@ -157,9 +160,24 @@ impl SearchView {
         cx.notify();
     }
 
+    fn update_snapshot(&mut self, snapshot: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
+        if snapshot.revision != self.snapshot.revision {
+            self.snapshot = snapshot;
+            if self.search_task.is_none() {
+                self.search(window, cx, false);
+            }
+        }
+    }
+
     fn search(&mut self, window: &mut Window, cx: &mut Context<Self>, reveal_selection: bool) {
         self.pending_open = None;
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.starting && !self.snapshot.loaded {
+            self.pending_search = self.search_task.as_ref().map(|_| reveal_selection);
+            self.searching = false;
+            cx.notify();
+            return;
+        }
         let query = Query::parse(
             &self.input.read(cx).value(),
             self.case,
@@ -169,6 +187,8 @@ impl SearchView {
         let query = match query {
             Ok(query) => query,
             Err(error) => {
+                self.starting = false;
+                self.pending_search = None;
                 self.error = Some(error);
                 self.results = Arc::new(Vec::new());
                 self.selected = None;
@@ -179,6 +199,13 @@ impl SearchView {
         };
         self.error = None;
         self.searching = true;
+        if self.search_task.is_some() {
+            self.pending_search = Some(reveal_selection);
+            cx.notify();
+            return;
+        }
+        let revision = self.snapshot.revision;
+        let loaded = self.snapshot.loaded;
         let entries = self.snapshot.entries.clone();
         let filter = self.filter;
         let sort = self.sort;
@@ -209,19 +236,21 @@ impl SearchView {
                         }
                     }
                     match sort {
+                        // Stable sorting keeps equal names in the snapshot's path order.
                         Sort::Name => results.sort_by_cached_key(|e| {
-                            (
-                                e.path
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .to_lowercase(),
-                                e.path.clone(),
-                            )
+                            e.path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_lowercase()
                         }),
-                        Sort::Path => results.sort_by(|a, b| a.path.cmp(&b.path)),
-                        Sort::Size => results
-                            .sort_by(|a, b| a.size.cmp(&b.size).then_with(|| a.path.cmp(&b.path))),
+                        // Snapshots arrive in path order; filtering preserves it.
+                        Sort::Path => {}
+                        Sort::Size => results.sort_by(|a, b| {
+                            a.allocated_size
+                                .cmp(&b.allocated_size)
+                                .then_with(|| a.path.cmp(&b.path))
+                        }),
                         Sort::Modified => results.sort_by(|a, b| {
                             a.modified
                                 .cmp(&b.modified)
@@ -231,11 +260,20 @@ impl SearchView {
                     if descending {
                         results.reverse();
                     }
+                    if current.load(Ordering::Relaxed) != generation {
+                        return None;
+                    }
                     Some(Arc::new(results))
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
+                this.search_task = None;
                 if this.generation.load(Ordering::Relaxed) != generation {
+                    if let Some(reveal_selection) = this.pending_search.take() {
+                        let pending_open = this.pending_open;
+                        this.search(window, cx, reveal_selection);
+                        this.pending_open = pending_open;
+                    }
                     return;
                 }
                 if let Some(results) = result {
@@ -244,6 +282,9 @@ impl SearchView {
                         .or_else(|| (!results.is_empty()).then_some(0));
                     this.results = results;
                     this.searching = false;
+                    if this.starting && loaded {
+                        this.starting = false;
+                    }
                     if reveal_selection {
                         this.scroll
                             .scroll_to_item(this.selected.unwrap_or(0), ScrollStrategy::Top);
@@ -252,6 +293,9 @@ impl SearchView {
                         this.open(reveal, window, cx);
                     }
                     cx.notify();
+                    if this.snapshot.revision != revision {
+                        this.search(window, cx, false);
+                    }
                 }
             });
         }));
@@ -376,7 +420,11 @@ impl SearchView {
             .ghost()
             .small()
             .accessibility_label(label)
-            .tooltip(format!("Sort by {}", label.to_lowercase()))
+            .tooltip(if sort == Sort::Size {
+                "Sort by size on disk".to_string()
+            } else {
+                format!("Sort by {}", label.to_lowercase())
+            })
             .w(px(width))
             .px_2()
             .child(
@@ -412,11 +460,91 @@ impl SearchView {
 
 impl Render for SearchView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let startup_loading = self.starting.then(|| {
+            let stage = if !self.snapshot.loaded {
+                "Loading files and folders…"
+            } else {
+                "Preparing your search…"
+            };
+            div()
+                .id("startup-loading")
+                .test_support()
+                .role(Role::Status)
+                .aria_label(stage)
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_6()
+                .px_6()
+                .bg(cx.theme().table)
+                .text_color(cx.theme().foreground)
+                .child(
+                    div()
+                        .size_16()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_2xl()
+                        .bg(cx.theme().selection)
+                        .child(
+                            Icon::new(IconName::HardDrive)
+                                .size_8()
+                                .text_color(cx.theme().link),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_2()
+                        .text_center()
+                        .child(
+                            div()
+                                .text_xl()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Getting your files ready"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Your complete file list will appear when it’s ready."),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_80()
+                        .max_w_full()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            Progress::new("startup-progress")
+                                .small()
+                                .loading(true)
+                                .accessibility_label("Preparing your file index"),
+                        )
+                        .child(
+                            div()
+                                .text_center()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(stage),
+                        ),
+                )
+                .into_any_element()
+        });
         let results = self.results.clone();
         let selected = self.selected;
         let owner = cx.entity().downgrade();
         let action_context = self.results_focus.clone();
         let no_results = self.results.is_empty();
+        let preparing_index =
+            !self.roots.is_empty() && self.error.is_none() && self.snapshot.scanning;
         let (empty_icon, empty_title, empty_description) = if self.roots.is_empty() {
             (
                 IconName::FolderPlus,
@@ -433,7 +561,7 @@ impl Render for SearchView {
             (
                 IconName::HardDrive,
                 "Getting your files ready",
-                "Results appear as folders are indexed. You can keep searching.",
+                "Making your files searchable. You can keep typing while we scan.",
             )
         } else if self.searching {
             (
@@ -511,7 +639,7 @@ impl Render for SearchView {
                                     .text_color(if entry.is_dir { cx.theme().link } else { cx.theme().muted_foreground }))
                                 .child(div().min_w_0().truncate().child(name)))
                             .child(div().flex_1().min_w_0().pr_3().truncate().text_color(cx.theme().muted_foreground).child(parent))
-                            .child(div().w(px(90.)).flex_shrink_0().child(if entry.is_dir { "—".into() } else { format_size(entry.size) }))
+                            .child(div().w(px(90.)).flex_shrink_0().child(if entry.is_dir { "—".into() } else { format_size(entry.allocated_size) }))
                             .child(div().w(px(90.)).flex_shrink_0().truncate().child(kind))
                             .child(div().w(px(110.)).flex_shrink_0().child(format_modified(entry.modified)))
                             .capture_any_mouse_down(move |_, window, cx| {
@@ -573,11 +701,16 @@ impl Render for SearchView {
                     }).collect()
                 }).size_full().track_scroll(&self.scroll)
             ).child(Scrollbar::vertical(&self.scroll))
-                .when(no_results, |this| this.child(div().absolute().inset_0().flex().flex_col().gap_3().items_center().justify_center().px_5()
+                .children(startup_loading)
+                .when(no_results && !self.starting, |this| this.child(div().absolute().inset_0().flex().flex_col().gap_3().items_center().justify_center().px_5()
                     .child(div().flex().items_center().justify_center().size_12().rounded_lg().bg(cx.theme().muted)
-                        .child(Icon::new(empty_icon).size_6().text_color(cx.theme().muted_foreground)))
+                        .when(preparing_index, |this| this.bg(cx.theme().selection))
+                        .child(Icon::new(empty_icon).size_6().text_color(if preparing_index { cx.theme().link } else { cx.theme().muted_foreground })))
                     .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(empty_title))
                     .child(div().text_sm().text_color(cx.theme().muted_foreground).child(empty_description))
+                    .when(preparing_index, |this| this.child(div().w_72().max_w_full().mt_2().flex().flex_col().gap_2()
+                        .child(Progress::new("index-progress").small().loading(true).accessibility_label("Preparing your file index"))
+                        .child(div().text_center().text_xs().text_color(cx.theme().muted_foreground).child("Scanning files and folders…"))))
                     .when(self.roots.is_empty(), |this| this.child(Button::new("empty-add-folders").primary().icon(IconName::FolderPlus).label("Add indexed folders")
                         .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::OpenSettings), cx))))
                     .when(!self.roots.is_empty() && !self.snapshot.scanning && !self.searching, |this| this.child(Button::new("reset-search").label("Reset search")
@@ -602,6 +735,7 @@ impl Render for SearchView {
                     .on_click(|_, _, cx| cx.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")))
                 .child(div().id("navigation-hints").test_support().text_xs().text_color(cx.theme().muted_foreground).child("↑ ↓ Navigate    Space Quick Look    ↵ Open    ⌘ ↵ Reveal"))))
             .children(self.snapshot.warning.clone().map(|warning| div().id("index-warnings").test_support().role(Role::Status).aria_label(warning.clone()).max_h(px(80.)).overflow_y_scroll().px_5().pb_2().bg(cx.theme().status_bar).text_xs().text_color(cx.theme().muted_foreground).child(warning)))
+            .into_any_element()
     }
 }
 
@@ -700,6 +834,286 @@ mod tests {
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
     use gpui_kit::{AppContext, ScrollStrategy, TestAppContext};
     use std::{path::PathBuf, sync::Arc};
+
+    #[gpui_kit::test]
+    async fn startup_hides_partial_results_until_the_complete_search_finishes(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            cx.set_global(Settings {
+                roots: vec![PathBuf::from("/fixture")],
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::size(gpui_kit::px(1050.), gpui_kit::px(450.)),
+            |window, cx| {
+                window.set_scroll_layers(false);
+                SearchView::new(None, window, cx)
+            },
+        );
+        let entries: Vec<_> = (0..1500)
+            .map(|i| {
+                Arc::new(Entry {
+                    path: PathBuf::from(format!("/fixture/file-{i:04}.txt")),
+                    is_dir: i == 0,
+                    allocated_size: 0,
+                    size: 1,
+                    modified: None,
+                })
+            })
+            .collect();
+        window
+            .update(cx, |view, window, cx| {
+                view._poll = gpui_kit::Task::ready(());
+                view.search_task = None;
+                view.starting = true;
+                let mut snapshot = view.snapshot.clone();
+                snapshot.scanning = true;
+                snapshot.loaded = false;
+                snapshot.revision += 1;
+                snapshot.entries = Arc::new(entries[..1024].to_vec());
+                view.update_snapshot(snapshot, window, cx);
+                assert!(
+                    view.search_task.is_none(),
+                    "Do not search a partial startup snapshot"
+                );
+            })
+            .unwrap();
+        for mode in [
+            gpui_kit::component::ThemeMode::Light,
+            gpui_kit::component::ThemeMode::Dark,
+        ] {
+            cx.update(|cx| gpui_kit::component::Theme::change(mode, None, cx));
+            cx.update_window(window.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let page = window.find("startup-loading");
+                let progress = window.find("startup-progress");
+                assert_eq!(page.label(), Some("Loading files and folders…"));
+                assert!(progress.visible());
+                assert_eq!(progress.bounds().center().x, page.bounds().center().x);
+                assert!(progress.bounds().bottom() <= page.bounds().bottom());
+                assert_eq!(page.bounds(), window.find("results-table").bounds());
+                assert_eq!(window.find("results-table").label(), Some("0 results"));
+                assert!(window.try_find(("result", 0usize)).is_none());
+                assert!(window.find("result-count").visible());
+                assert!(window.find("search-input").visible());
+                assert!(window.find("Name").visible());
+                assert!(window.find("open").visible());
+            })
+            .unwrap();
+        }
+        cx.update_window(window.into(), |_, window, cx| {
+            window.click("search-input", cx);
+            window.input("file-", cx);
+            window.click(("filter", 1usize), cx);
+            assert_eq!(window.find("search-input").value(), Some("file-"));
+            assert!(window.find("startup-progress").visible());
+        })
+        .unwrap();
+        let task = window
+            .update(cx, |view, window, cx| {
+                let mut snapshot = view.snapshot.clone();
+                snapshot.entries = Arc::new(entries);
+                snapshot.loaded = true;
+                snapshot.revision += 1;
+                view.update_snapshot(snapshot, window, cx);
+                view.search_task.take().unwrap()
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("startup-loading").label(),
+                Some("Preparing your search…")
+            );
+            assert_eq!(window.find("results-table").label(), Some("0 results"));
+        })
+        .unwrap();
+        task.await;
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("startup-loading").is_none());
+            assert_eq!(window.find("results-table").label(), Some("1499 results"));
+            assert_eq!(window.find("search-input").value(), Some("file-"));
+        })
+        .unwrap();
+        window
+            .update(cx, |view, _, _| {
+                assert!(
+                    view.snapshot.scanning,
+                    "Background checks must not delay cached results"
+                );
+            })
+            .unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                view.snapshot.scanning = true;
+                cx.notify();
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("startup-loading").is_none());
+            assert_eq!(window.find("results-table").label(), Some("1499 results"));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn live_updates_finish_search_before_refreshing_and_queue_the_latest_query(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            cx.set_global(Settings { roots: Vec::new() });
+        });
+        let window = cx.open_window(
+            gpui_kit::size(gpui_kit::px(1050.), gpui_kit::px(450.)),
+            |window, cx| {
+                window.set_scroll_layers(false);
+                SearchView::new(None, window, cx)
+            },
+        );
+        let first = window
+            .update(cx, |view, window, cx| {
+                view._poll = gpui_kit::Task::ready(());
+                view.search_task = None;
+                view.snapshot.entries = Arc::new(
+                    (0..2000)
+                        .map(|i| {
+                            Arc::new(Entry {
+                                path: PathBuf::from(format!("/fixture/dir-{i:04}/Report.txt")),
+                                is_dir: false,
+                                allocated_size: 0,
+                                size: 1,
+                                modified: None,
+                            })
+                        })
+                        .collect(),
+                );
+                view.search(window, cx, true);
+                let generation = view.generation.load(std::sync::atomic::Ordering::Relaxed);
+                for _ in 0..10 {
+                    let mut snapshot = view.snapshot.clone();
+                    snapshot.revision += 1;
+                    view.update_snapshot(snapshot, window, cx);
+                }
+                assert_eq!(
+                    view.generation.load(std::sync::atomic::Ordering::Relaxed),
+                    generation
+                );
+                view.search_task.take().unwrap()
+            })
+            .unwrap();
+        first.await;
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(
+                    view.results.len(),
+                    2000,
+                    "Live updates must not starve results"
+                );
+                assert!(
+                    view.searching,
+                    "Refresh the newer snapshot after displaying results"
+                );
+                assert_eq!(
+                    view.results[0].path,
+                    PathBuf::from("/fixture/dir-0000/Report.txt")
+                );
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("search-input", cx);
+            window.input("missing", cx);
+        })
+        .unwrap();
+        let refresh = window
+            .update(cx, |view, _, _| {
+                assert!(view.pending_search.is_some());
+                view.search_task.take().unwrap()
+            })
+            .unwrap();
+        refresh.await;
+        let latest = window
+            .update(cx, |view, _, _| view.search_task.take().unwrap())
+            .unwrap();
+        latest.await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(!view.searching);
+                assert!(view.results.is_empty());
+                assert!(view.pending_search.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn first_scan_shows_progress_and_keeps_search_available(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            cx.set_global(Settings { roots: Vec::new() });
+        });
+        let window = cx.open_window(
+            gpui_kit::size(gpui_kit::px(1050.), gpui_kit::px(450.)),
+            |window, cx| {
+                window.set_scroll_layers(false);
+                SearchView::new(None, window, cx)
+            },
+        );
+        window
+            .update(cx, |view, _, cx| {
+                view._poll = gpui_kit::Task::ready(());
+                view.search_task = None;
+                view.roots = vec![PathBuf::from("/fixture")];
+                view.snapshot.scanning = true;
+                cx.notify();
+            })
+            .unwrap();
+        for mode in [
+            gpui_kit::component::ThemeMode::Light,
+            gpui_kit::component::ThemeMode::Dark,
+        ] {
+            cx.update(|cx| gpui_kit::component::Theme::change(mode, None, cx));
+            cx.update_window(window.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let progress = window.find("index-progress");
+                assert_eq!(progress.label(), Some("Preparing your file index"));
+                assert_eq!(progress.role(), Some(gpui_kit::Role::ProgressIndicator));
+                assert!(progress.visible());
+                let bounds = progress.bounds();
+                let table = window.find("results-table").bounds();
+                assert!(bounds.size.width > gpui_kit::px(0.));
+                assert!(bounds.origin.y >= table.origin.y && bounds.bottom() <= table.bottom());
+                assert_eq!(bounds.center().x, table.center().x);
+            })
+            .unwrap();
+        }
+        cx.update_window(window.into(), |_, window, cx| {
+            window.click("search-input", cx);
+            window.input("report", cx);
+            assert_eq!(window.find("search-input").value(), Some("report"));
+            assert!(window.find("index-progress").visible());
+        })
+        .unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                view.snapshot.scanning = false;
+                cx.notify();
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("index-progress").is_none());
+            assert_eq!(window.find("search-input").value(), Some("report"));
+        })
+        .unwrap();
+    }
 
     #[test]
     fn trash_preserves_contents_and_symlink_targets_and_reports_invalid_paths() {
@@ -874,13 +1288,15 @@ mod tests {
         let task = window
             .update(cx, |view, window, cx| {
                 view._poll = gpui_kit::Task::ready(());
+                view.search_task = None;
                 view.snapshot.entries = Arc::new(
                     (0..500)
                         .map(|i| {
                             Arc::new(Entry {
                                 path: PathBuf::from(format!("/fixture/file-{i:03}.txt")),
                                 is_dir: false,
-                                size: 123,
+                                allocated_size: i as u64 * 4096,
+                                size: (500 - i) as u64,
                                 modified: None,
                             })
                         })
@@ -1001,6 +1417,7 @@ mod tests {
                 let entry = Arc::new(Entry {
                     path: PathBuf::from("/fixture/file.txt"),
                     is_dir: false,
+                    allocated_size: 0,
                     size: 123,
                     modified: None,
                 });
@@ -1052,6 +1469,7 @@ mod tests {
         let mut entry = Entry {
             path: "/tmp/photo.JPG".into(),
             is_dir: false,
+            allocated_size: 0,
             size: 1,
             modified: None,
         };

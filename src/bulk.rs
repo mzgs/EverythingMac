@@ -5,7 +5,10 @@ use std::{
     io,
     os::{
         fd::AsRawFd,
-        unix::{ffi::OsStringExt, fs::OpenOptionsExt},
+        unix::{
+            ffi::OsStringExt,
+            fs::{MetadataExt, OpenOptionsExt},
+        },
     },
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
@@ -18,6 +21,7 @@ const COMMON: u32 = libc::ATTR_CMN_RETURNED_ATTRS
     | libc::ATTR_CMN_NAME
     | libc::ATTR_CMN_OBJTYPE
     | libc::ATTR_CMN_MODTIME;
+const FILE_ATTRIBUTES: u32 = libc::ATTR_FILE_ALLOCSIZE | libc::ATTR_FILE_DATALENGTH;
 
 pub(crate) fn metadata(path: &Path) -> io::Result<Entry> {
     let metadata = fs::symlink_metadata(path)?;
@@ -25,6 +29,7 @@ pub(crate) fn metadata(path: &Path) -> io::Result<Entry> {
         path: path.to_owned(),
         is_dir: metadata.is_dir(),
         size: metadata.len(),
+        allocated_size: metadata.blocks() * 512,
         modified: metadata.modified().ok(),
     })
 }
@@ -62,7 +67,7 @@ fn bulk(path: &Path, stopped: &AtomicBool) -> io::Result<Vec<(PathBuf, io::Resul
     let mut attributes: libc::attrlist = unsafe { std::mem::zeroed() };
     attributes.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
     attributes.commonattr = COMMON;
-    attributes.fileattr = libc::ATTR_FILE_DATALENGTH;
+    attributes.fileattr = FILE_ATTRIBUTES;
     let mut buffer = vec![0u8; 64 * 1024];
     let mut entries = Vec::new();
     loop {
@@ -90,7 +95,7 @@ fn bulk(path: &Path, stopped: &AtomicBool) -> io::Result<Vec<(PathBuf, io::Resul
                 return Err(io::ErrorKind::Interrupted.into());
             }
             let length = u32_at(&buffer, offset)? as usize;
-            if length < 64 {
+            if length < 56 {
                 return Err(invalid());
             }
             let end = offset.checked_add(length).ok_or_else(invalid)?;
@@ -162,11 +167,11 @@ fn decode(parent: &Path, b: &[u8]) -> io::Result<(OsString, Option<Entry>)> {
     if common & required != required
         || u32_at(b, 24)? != 0
         || u32_at(b, 36)? != 1
-        || u32_at(b, 16)? & libc::ATTR_FILE_DATALENGTH == 0
+        || u32_at(b, 16)? & FILE_ATTRIBUTES != FILE_ATTRIBUTES
     {
         return Ok((name, None));
     }
-    if start < 64 {
+    if start < 72 {
         return Err(invalid());
     }
     let seconds = u64_at(b, 40)? as i64;
@@ -185,7 +190,8 @@ fn decode(parent: &Path, b: &[u8]) -> io::Result<(OsString, Option<Entry>)> {
     let entry = Entry {
         path: parent.join(&name),
         is_dir: false,
-        size: u64_at(b, 56)?,
+        allocated_size: u64_at(b, 56)?,
+        size: u64_at(b, 64)?,
         modified: Some(modified),
     };
     Ok((name, Some(entry)))
@@ -211,6 +217,8 @@ mod tests {
         ));
         fs::create_dir(&root).unwrap();
         fs::write(root.join("regular"), b"hello").unwrap();
+        let sparse = fs::File::create(root.join("sparse.raw")).unwrap();
+        sparse.set_len(1024 * 1024 * 1024).unwrap();
         fs::write(root.join("İ résumé 🐈"), b"unicode").unwrap();
         fs::create_dir(root.join("folder")).unwrap();
         symlink("folder", root.join("link")).unwrap();
@@ -220,9 +228,14 @@ mod tests {
             .unwrap();
         let entries = bulk(&root, &AtomicBool::new(false))
             .expect("Native bulk path must work, not silently fall back");
-        assert_eq!(entries.len(), 5);
+        assert_eq!(entries.len(), 6);
         for (path, entry) in entries {
-            assert_eq!(entry.unwrap(), metadata(&path).unwrap());
+            let entry = entry.unwrap();
+            assert_eq!(entry, metadata(&path).unwrap());
+            if path.ends_with("sparse.raw") {
+                assert_eq!(entry.size, 1024 * 1024 * 1024);
+                assert!(entry.allocated_size < entry.size);
+            }
         }
         assert!(
             bulk(&root.join("link"), &AtomicBool::new(false)).is_err(),
@@ -237,16 +250,17 @@ mod tests {
     }
 
     fn record(name: &[u8]) -> Vec<u8> {
-        let mut b = vec![0; 64 + name.len()];
+        let mut b = vec![0; 72 + name.len()];
         let len = b.len() as u32;
         b[..4].copy_from_slice(&len.to_ne_bytes());
         b[4..8].copy_from_slice(&COMMON.to_ne_bytes());
-        b[16..20].copy_from_slice(&libc::ATTR_FILE_DATALENGTH.to_ne_bytes());
-        b[28..32].copy_from_slice(&36i32.to_ne_bytes());
+        b[16..20].copy_from_slice(&FILE_ATTRIBUTES.to_ne_bytes());
+        b[28..32].copy_from_slice(&44i32.to_ne_bytes());
         b[32..36].copy_from_slice(&(name.len() as u32).to_ne_bytes());
         b[36..40].copy_from_slice(&1u32.to_ne_bytes());
-        b[56..64].copy_from_slice(&123u64.to_ne_bytes());
-        b[64..].copy_from_slice(name);
+        b[56..64].copy_from_slice(&4096u64.to_ne_bytes());
+        b[64..72].copy_from_slice(&123u64.to_ne_bytes());
+        b[72..].copy_from_slice(name);
         b
     }
 
@@ -257,6 +271,7 @@ mod tests {
         let (raw, _) = decode(parent, &record(b"raw-\xff\0")).unwrap();
         assert_eq!(raw.as_bytes(), b"raw-\xff");
         assert_eq!(decode(parent, &b).unwrap().1.unwrap().size, 123);
+        assert_eq!(decode(parent, &b).unwrap().1.unwrap().allocated_size, 4096);
         for end in 0..b.len() {
             assert!(decode(parent, &b[..end]).is_err());
         }

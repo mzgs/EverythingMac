@@ -107,7 +107,9 @@ async fn wait_count(cx: &mut TestAppContext, handle: AnyWindowHandle, count: usi
     cx.wait_for(handle, Duration::from_secs(10), |window, _| {
         // The native index worker needs wall time while GPUI advances its test clock.
         std::thread::sleep(Duration::from_millis(2));
-        window.find("results-table").label() == Some(label.as_str())
+        window
+            .try_find("results-table")
+            .is_some_and(|table| table.label() == Some(label.as_str()))
     })
     .await;
 }
@@ -254,7 +256,7 @@ async fn trash_menu_reports_missing_file_without_touching_other_results(cx: &mut
     let handle = fixture.open(cx);
     wait_count(cx, handle, 6).await;
     cx.update_window(handle, |_, window, cx| {
-        window.right_click(("result", 1usize), cx);
+        window.right_click(("result", 3usize), cx);
     })
     .unwrap();
     cx.wait_for(handle, Duration::from_secs(3), |window, _| {
@@ -263,7 +265,7 @@ async fn trash_menu_reports_missing_file_without_touching_other_results(cx: &mut
     .await;
     cx.update_window(handle, |_, window, cx| {
         assert_eq!(
-            window.find(("result", 1usize)).label(),
+            window.find(("result", 3usize)).label(),
             fixture.root.join("alpha.txt").to_str()
         );
         fs::remove_file(fixture.root.join("alpha.txt")).unwrap();
@@ -287,7 +289,7 @@ async fn rename_menu_can_cancel_reject_collisions_and_update_results(cx: &mut Te
     wait_count(cx, handle, 6).await;
     for cancel in [true, false] {
         cx.update_window(handle, |_, window, cx| {
-            window.right_click(("result", 1usize), cx);
+            window.right_click(("result", 3usize), cx);
         })
         .unwrap();
         cx.wait_for(handle, Duration::from_secs(3), |window, _| {

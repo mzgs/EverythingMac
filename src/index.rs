@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
@@ -20,6 +20,7 @@ pub struct Entry {
     pub path: PathBuf,
     pub is_dir: bool,
     pub size: u64,
+    pub allocated_size: u64,
     pub modified: Option<SystemTime>,
 }
 
@@ -27,6 +28,7 @@ pub struct Entry {
 pub struct Snapshot {
     pub entries: Arc<Vec<Arc<Entry>>>,
     pub scanning: bool,
+    pub loaded: bool,
     pub skipped: usize,
     pub scan_warning: Option<String>,
     pub warning: Option<String>,
@@ -52,6 +54,30 @@ pub(crate) enum Message {
 type Entries = BTreeMap<PathBuf, Arc<Entry>>;
 type Errors = BTreeMap<PathBuf, String>;
 
+pub(crate) fn is_cloud_path(path: &Path) -> bool {
+    static HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let Some(home) = HOME.get_or_init(dirs::home_dir) else {
+        return false;
+    };
+    let Ok(relative) = path.strip_prefix(home) else {
+        return false;
+    };
+    let mut parts = relative.components();
+    // shortcut: standard provider locations; add provider discovery for relocated sync folders.
+    match parts.next().and_then(|part| part.as_os_str().to_str()) {
+        Some("Library") => matches!(
+            parts.next().and_then(|part| part.as_os_str().to_str()),
+            Some("CloudStorage" | "Mobile Documents")
+        ),
+        Some(
+            "iCloud Drive" | "Dropbox" | "Google Drive" | "GoogleDrive" | "OneDrive" | "Box Sync"
+            | "pCloud Drive" | "MEGA",
+        ) => true,
+        Some(name) => name.starts_with("OneDrive - ") || name.starts_with("Dropbox ("),
+        None => false,
+    }
+}
+
 impl Index {
     pub fn start(mut roots: Vec<PathBuf>, database_path: Option<PathBuf>) -> Self {
         if let Ok(cwd) = std::env::current_dir() {
@@ -71,6 +97,7 @@ impl Index {
         }
         roots.sort();
         roots.dedup();
+        roots.retain(|root| !is_cloud_path(root));
         let mut distinct_roots: Vec<PathBuf> = Vec::new();
         for root in roots {
             if !distinct_roots.iter().any(|parent| root.starts_with(parent)) {
@@ -80,6 +107,7 @@ impl Index {
         let snapshot = Arc::new(RwLock::new(Snapshot {
             entries: Arc::new(Vec::new()),
             scanning: true,
+            loaded: false,
             skipped: 0,
             scan_warning: None,
             warning: None,
@@ -140,9 +168,7 @@ fn run(
     event_sender: Sender<Message>,
 ) {
     let mut database = Database::open(database_path.as_deref());
-    let mut entries = database.load(&roots, |entries| {
-        publish(&snapshot, entries, &Errors::new(), &None, &None, true);
-    });
+    let mut entries = database.load(&roots);
     let mut plan = fs_events::Plan::new(&roots);
     let mut identity = plan.as_ref().map(|plan| plan.identities.clone());
     let baseline = plan
@@ -208,6 +234,7 @@ fn run(
                         error.clone(),
                     )
                 })
+                .filter(|(path, _)| !is_cloud_path(path))
                 .collect()
         })
         .unwrap_or_default();
@@ -304,6 +331,7 @@ fn run(
                             rebuild_needed = true;
                         }
                         if !roots.iter().any(|root| event.path.starts_with(root))
+                            || is_cloud_path(&event.path)
                             || database
                                 .excluded
                                 .as_ref()
@@ -642,7 +670,10 @@ fn scan(
     excluded: Option<&Path>,
     depth: usize,
 ) {
-    if stopped.load(Ordering::Relaxed) || excluded.is_some_and(|path| root.starts_with(path)) {
+    if stopped.load(Ordering::Relaxed)
+        || is_cloud_path(root)
+        || excluded.is_some_and(|path| root.starts_with(path))
+    {
         return;
     }
     let root_entry = match bulk::metadata(root) {
@@ -657,6 +688,10 @@ fn scan(
         folders.push((root.to_owned(), 0));
     }
     entries.insert(root.to_owned(), Arc::new(root_entry));
+    if depth == usize::MAX && !folders.is_empty() {
+        scan_folders(root, entries, errors, stopped, excluded);
+        return;
+    }
     while let Some((folder, level)) = folders.pop() {
         if stopped.load(Ordering::Relaxed) {
             return;
@@ -667,7 +702,9 @@ fn scan(
                     if stopped.load(Ordering::Relaxed) {
                         return;
                     }
-                    if excluded.is_some_and(|excluded| path.starts_with(excluded)) {
+                    if is_cloud_path(&path)
+                        || excluded.is_some_and(|excluded| path.starts_with(excluded))
+                    {
                         continue;
                     }
                     match entry {
@@ -690,6 +727,87 @@ fn scan(
     }
 }
 
+fn scan_folders(
+    root: &Path,
+    entries: &mut Entries,
+    errors: &mut Errors,
+    stopped: &AtomicBool,
+    excluded: Option<&Path>,
+) {
+    let workers = std::thread::available_parallelism().map_or(1, usize::from);
+    let (jobs, receiver) = mpsc::sync_channel::<PathBuf>(workers);
+    let receiver = Mutex::new(receiver);
+    let (completed, results) = mpsc::sync_channel(workers);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let receiver = &receiver;
+            let completed = completed.clone();
+            scope.spawn(move || {
+                loop {
+                    let folder = receiver.lock().unwrap().recv();
+                    let Ok(folder) = folder else { break };
+                    if stopped.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let children = bulk::read_directory(&folder, stopped);
+                    if completed.send((folder, children)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(completed);
+        let mut folders = vec![root.to_owned()];
+        let mut active = 0;
+        while !stopped.load(Ordering::Relaxed) {
+            while active < workers {
+                let Some(folder) = folders.pop() else { break };
+                if jobs.send(folder).is_err() {
+                    break;
+                }
+                active += 1;
+            }
+            if active == 0 {
+                break;
+            }
+            let Ok((folder, children)) = results.recv() else {
+                break;
+            };
+            active -= 1;
+            match children {
+                Ok(children) => {
+                    for (path, entry) in children {
+                        if stopped.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if is_cloud_path(&path)
+                            || excluded.is_some_and(|excluded| path.starts_with(excluded))
+                        {
+                            continue;
+                        }
+                        match entry {
+                            Ok(entry) => {
+                                if entry.is_dir {
+                                    folders.push(path.clone());
+                                }
+                                entries.insert(path, Arc::new(entry));
+                            }
+                            Err(error) => {
+                                errors.insert(path, error.to_string());
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    errors.insert(folder, error.to_string());
+                }
+            }
+        }
+        drop(jobs);
+        drop(results);
+    });
+}
+
 fn publish(
     snapshot: &RwLock<Snapshot>,
     entries: &Entries,
@@ -710,13 +828,17 @@ fn publish(
         .flatten()
         .collect();
     let warning = (!warnings.is_empty()).then(|| warnings.join("\n"));
+    let entries = Arc::new(entries.values().cloned().collect());
     let mut snapshot = snapshot.write().unwrap();
-    snapshot.entries = Arc::new(entries.values().cloned().collect());
+    let previous = std::mem::replace(&mut snapshot.entries, entries);
+    snapshot.loaded |= !snapshot.entries.is_empty() || !scanning;
     snapshot.scanning = scanning;
     snapshot.skipped = errors.len();
     snapshot.scan_warning = scan_warning;
     snapshot.warning = warning;
     snapshot.revision += 1;
+    drop(snapshot);
+    drop(previous);
 }
 
 #[cfg(test)]
@@ -758,6 +880,143 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(30));
         }
+    }
+
+    #[test]
+    fn cached_snapshot_is_loaded_while_background_checks_continue() {
+        let snapshot = RwLock::new(Snapshot {
+            entries: Arc::new(Vec::new()),
+            scanning: true,
+            loaded: false,
+            skipped: 0,
+            scan_warning: None,
+            warning: None,
+            revision: 0,
+            full_scans: 0,
+            replayed: false,
+        });
+        let errors = Errors::new();
+        publish(&snapshot, &Entries::new(), &errors, &None, &None, true);
+        assert!(
+            !snapshot.read().unwrap().loaded,
+            "A missing cache still needs its first scan"
+        );
+        let path = PathBuf::from("/fixture/cached.txt");
+        let cached = Entries::from([(
+            path.clone(),
+            Arc::new(Entry {
+                path,
+                is_dir: false,
+                allocated_size: 0,
+                size: 1,
+                modified: None,
+            }),
+        )]);
+        publish(&snapshot, &cached, &errors, &None, &None, true);
+        let loaded = snapshot.read().unwrap().clone();
+        assert!(loaded.loaded && loaded.scanning);
+        assert_eq!(loaded.entries.len(), 1);
+        publish(&snapshot, &Entries::new(), &errors, &None, &None, false);
+        let refreshed = snapshot.read().unwrap();
+        assert!(refreshed.loaded && !refreshed.scanning);
+        assert!(
+            refreshed.entries.is_empty(),
+            "Background checks may remove stale cached files"
+        );
+    }
+
+    #[test]
+    fn cloud_paths_are_skipped_without_hiding_similarly_named_local_folders() {
+        let home = dirs::home_dir().unwrap();
+        for folder in [
+            "Library/CloudStorage",
+            "Library/Mobile Documents",
+            "iCloud Drive",
+            "Dropbox",
+            "Dropbox (Work)",
+            "Google Drive",
+            "GoogleDrive",
+            "OneDrive",
+            "OneDrive - Work",
+            "Box Sync",
+            "pCloud Drive",
+            "MEGA",
+        ] {
+            let path = home.join(folder);
+            assert!(is_cloud_path(&path), "{path:?}");
+            assert!(is_cloud_path(&path.join("nested/file.txt")));
+            let mut entries = Entries::new();
+            let mut errors = Errors::new();
+            scan(
+                &path,
+                &mut entries,
+                &mut errors,
+                &AtomicBool::new(false),
+                None,
+                usize::MAX,
+            );
+            assert!(entries.is_empty() && errors.is_empty());
+        }
+        for folder in [
+            "Documents",
+            "Library/CloudStorage-local",
+            "Library/Mobile Documents backup",
+            "Dropbox-backup",
+            "Developer/Dropbox",
+            "OneDrive-notes",
+        ] {
+            assert!(!is_cloud_path(&home.join(folder)), "{folder}");
+        }
+    }
+
+    #[test]
+    fn parallel_scan_covers_wide_and_deep_trees_and_preserves_exclusions() {
+        let root = TempDir::new();
+        let outside = TempDir::new();
+        let excluded = root.0.join("cache");
+        fs::create_dir(&excluded).unwrap();
+        fs::write(excluded.join("index.sqlite3"), "excluded").unwrap();
+        fs::write(outside.0.join("outside.txt"), "outside").unwrap();
+        std::os::unix::fs::symlink(&outside.0, root.0.join("link")).unwrap();
+        let mut expected = BTreeSet::from([root.0.clone(), root.0.join("link")]);
+        for i in 0..32 {
+            let folder = root.0.join(format!("folder-{i}"));
+            let nested = folder.join("deep");
+            fs::create_dir_all(&nested).unwrap();
+            expected.extend([folder, nested.clone()]);
+            for j in 0..8 {
+                let file = nested.join(format!("file-{j}"));
+                fs::write(&file, "contents").unwrap();
+                expected.insert(file);
+            }
+        }
+        let stopped = AtomicBool::new(false);
+        let mut entries = Entries::new();
+        let mut errors = Errors::new();
+        scan(
+            &root.0,
+            &mut entries,
+            &mut errors,
+            &stopped,
+            Some(&excluded),
+            usize::MAX,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(entries.keys().cloned().collect::<BTreeSet<_>>(), expected);
+        for (path, entry) in &entries {
+            assert_eq!(entry.as_ref(), &bulk::metadata(path).unwrap());
+        }
+        let previous = entries.clone();
+        stopped.store(true, Ordering::Relaxed);
+        scan(
+            &root.0,
+            &mut entries,
+            &mut errors,
+            &stopped,
+            Some(&excluded),
+            usize::MAX,
+        );
+        assert_eq!(entries, previous);
     }
 
     #[test]
@@ -1045,7 +1304,7 @@ mod persistence_tests {
     }
 
     #[test]
-    fn large_cache_previews_before_loading_finishes_and_preserves_corrupt_data() {
+    fn large_cache_loads_completely_and_preserves_corrupt_data() {
         let fixture = fixture();
         let root = fixture.join("files");
         let path = fixture.join("cache/index.sqlite3");
@@ -1056,6 +1315,7 @@ mod persistence_tests {
                 let entry = Arc::new(Entry {
                     path: path.clone(),
                     is_dir: false,
+                    allocated_size: 0,
                     size: i,
                     modified: None,
                 });
@@ -1068,16 +1328,7 @@ mod persistence_tests {
             &AtomicBool::new(false),
         );
         assert!(database.warning.is_none());
-        let mut previews = Vec::new();
-        let loaded = database.load(&[root.clone()], |preview| {
-            previews.push(preview.len());
-            assert!(
-                preview
-                    .iter()
-                    .all(|(path, entry)| entries.get(path) == Some(entry))
-            );
-        });
-        assert_eq!(previews, [1024]);
+        let loaded = database.load(&[root.clone()]);
         assert_eq!(loaded, entries);
 
         let connection = rusqlite::Connection::open(&path).unwrap();
@@ -1090,10 +1341,11 @@ mod persistence_tests {
                 ],
             )
             .unwrap();
-        previews.clear();
-        let loaded = database.load(&[root], |preview| previews.push(preview.len()));
-        assert_eq!(previews, [1024]);
-        assert!(loaded.is_empty(), "A corrupt load must discard the preview");
+        let loaded = database.load(&[root]);
+        assert!(
+            loaded.is_empty(),
+            "A corrupt load must discard all loaded rows"
+        );
         assert!(database.warning.is_some());
         database.save(
             &Entries::new(),
@@ -1125,13 +1377,13 @@ mod persistence_tests {
             0o600
         );
         let mut db = Database::open(Some(&db_path));
-        assert_eq!(db.load(&[root.clone()], |_| {}).len(), 3);
+        assert_eq!(db.load(&[root.clone()]).len(), 3);
         drop(index);
         fs::rename(root.join("old.txt"), root.join("renamed.txt")).unwrap();
         fs::write(root.join("edited.txt"), "updated while closed").unwrap();
         fs::write(root.join("new.txt"), "new").unwrap();
         // A cache read returns the saved snapshot before filesystem reconciliation.
-        let cached = db.load(&[root.clone()], |_| {});
+        let cached = db.load(&[root.clone()]);
         assert!(cached.contains_key(&root.join("old.txt")));
         assert!(!cached.contains_key(&root.join("new.txt")));
         let index = Index::start(vec![root.clone()], Some(db_path.clone()));
@@ -1145,7 +1397,7 @@ mod persistence_tests {
             replayed.replayed,
             "A valid cache must select historical replay; native history-loss flags may still request recovery"
         );
-        let stored = db.load(&[root.clone()], |_| {});
+        let stored = db.load(&[root.clone()]);
         assert!(stored.contains_key(&root.join("renamed.txt")));
         assert!(stored.contains_key(&root.join("new.txt")));
         assert!(!stored.contains_key(&root.join("old.txt")));
@@ -1154,15 +1406,12 @@ mod persistence_tests {
         wait(&index, |s| {
             !s.entries.iter().any(|e| e.path == root.join("new.txt"))
         });
-        assert!(
-            !db.load(&[root.clone()], |_| {})
-                .contains_key(&root.join("new.txt"))
-        );
+        assert!(!db.load(&[root.clone()]).contains_key(&root.join("new.txt")));
         drop(index);
         let index = Index::start(Vec::new(), Some(db_path.clone()));
         wait(&index, |s| s.entries.is_empty());
         assert!(
-            db.load(&[root], |_| {}).is_empty(),
+            db.load(&[root]).is_empty(),
             "Removed roots must be pruned from disk"
         );
         drop(index);
@@ -1199,7 +1448,7 @@ mod persistence_tests {
         drop(index);
         // macOS can return zero before its history has been flushed; replay from zero is safe.
         let mut database = Database::open(Some(&path));
-        let cached = database.load(&roots, |_| {});
+        let cached = database.load(&roots);
         database.checkpoint.as_mut().unwrap().event_ids.fill(0);
         database.save(&cached, &BTreeSet::new(), &AtomicBool::new(false));
         assert!(database.warning.is_none());
@@ -1241,6 +1490,7 @@ mod persistence_tests {
         let entry = Arc::new(Entry {
             path: raw.clone(),
             is_dir: false,
+            allocated_size: 4096,
             size: u64::MAX,
             modified: Some(SystemTime::UNIX_EPOCH - Duration::new(10, 123)),
         });
@@ -1256,7 +1506,7 @@ mod persistence_tests {
         db.save(&entries, &changed, &stopped);
         assert_eq!(Database::open(Some(&path)).checkpoint, db.checkpoint);
         assert!(db.warning.is_none(), "{:?}", db.warning);
-        assert_eq!(db.load(&[fixture.clone()], |_| {})[&raw], entry);
+        assert_eq!(db.load(&[fixture.clone()])[&raw], entry);
         entries.clear();
         stopped.store(true, Ordering::Relaxed);
         db.checkpoint.as_mut().unwrap().event_ids = vec![2];
@@ -1268,13 +1518,13 @@ mod persistence_tests {
             "Rows and cursor must roll back together"
         );
         assert!(
-            db.load(&[fixture.clone()], |_| {}).contains_key(&raw),
+            db.load(&[fixture.clone()]).contains_key(&raw),
             "Cancelled transaction must preserve previous snapshot"
         );
         stopped.store(false, Ordering::Relaxed);
         db.save(&entries, &BTreeSet::new(), &stopped);
         assert!(
-            db.load(&[fixture.clone()], |_| {}).is_empty(),
+            db.load(&[fixture.clone()]).is_empty(),
             "Failed writes must be retried"
         );
         assert_eq!(
@@ -1293,7 +1543,7 @@ mod persistence_tests {
     }
 
     #[test]
-    fn migrates_version_one_without_losing_files_and_rejects_stale_roots() {
+    fn rejects_old_versions_without_losing_files_and_rejects_stale_roots() {
         let fixture = fixture();
         let root = fixture.join("files");
         fs::create_dir(&root).unwrap();
@@ -1306,18 +1556,36 @@ mod persistence_tests {
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection.busy_timeout(Duration::from_secs(3)).unwrap();
         connection
-            .execute_batch("DROP TABLE state; PRAGMA user_version = 1;")
+            .execute_batch("PRAGMA user_version = 1;")
             .unwrap();
         drop(index);
         let mut database = Database::open(Some(&path));
-        assert!(database.warning.is_none(), "{:?}", database.warning);
-        assert_eq!(database.load(&[root.clone()], |_| {}).len(), 2);
+        assert!(
+            database
+                .warning
+                .as_ref()
+                .unwrap()
+                .contains("Unsupported index database version")
+        );
+        assert!(database.load(&[root.clone()]).is_empty());
         assert!(database.checkpoint.is_none());
         drop(database);
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM files", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        connection
+            .execute_batch("PRAGMA user_version = 3; DELETE FROM state WHERE key = 'checkpoint';")
+            .unwrap();
         fs::write(root.join("new"), b"new").unwrap();
         let index = Index::start(vec![root.clone()], Some(path.clone()));
         let built = wait(&index, |s| s.entries.len() == 3);
-        assert_eq!(built.full_scans, 1, "Version 1 needs an initial checkpoint");
+        assert_eq!(
+            built.full_scans, 1,
+            "A missing checkpoint needs verification"
+        );
         drop(index);
         // Changed configured roots cannot reuse the old checkpoint.
         let added = fixture.join("added");
@@ -1330,6 +1598,46 @@ mod persistence_tests {
         assert_eq!(built.full_scans, 1);
         drop(index);
         drop(connection);
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn cached_cloud_paths_are_hidden_and_removed_on_save() {
+        let fixture = fixture();
+        let home = dirs::home_dir().unwrap();
+        let cloud = home.join("Library/CloudStorage/GoogleDrive-test/file.txt");
+        let local = home.join("Documents/local-test.txt");
+        let mut entries: Entries = [cloud.clone(), local.clone()]
+            .into_iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    Arc::new(Entry {
+                        path,
+                        is_dir: false,
+                        allocated_size: 0,
+                        size: 5,
+                        modified: None,
+                    }),
+                )
+            })
+            .collect();
+        let mut database = Database::open(Some(&fixture.join("index.sqlite3")));
+        let stopped = AtomicBool::new(false);
+        database.save(&entries, &entries.keys().cloned().collect(), &stopped);
+        entries = database.load(&[home]);
+        assert!(!entries.contains_key(&cloud));
+        assert!(entries.contains_key(&local));
+        database.save(&entries, &BTreeSet::new(), &stopped);
+        let connection = rusqlite::Connection::open(fixture.join("index.sqlite3")).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM files", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(connection);
+        drop(database);
         fs::remove_dir_all(fixture).unwrap();
     }
 
