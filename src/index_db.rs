@@ -20,6 +20,8 @@ use std::{
 type Entries = BTreeMap<PathBuf, Arc<Entry>>;
 type Metadata = (bool, u64, Option<(bool, u64, u32)>, u64);
 const APPLICATION_ID: i64 = 0x45564d43;
+// Bump when the schema or serialized metadata changes; older caches rebuild automatically.
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Checkpoint {
@@ -83,15 +85,19 @@ impl Database {
                 if tables != 0 {
                     return Err("Unrecognized index database; existing file was preserved".into());
                 }
-                let transaction = connection.transaction()?;
-                transaction.execute_batch("CREATE TABLE files (path BLOB PRIMARY KEY NOT NULL, metadata BLOB NOT NULL) WITHOUT ROWID;
-                    CREATE TABLE state (key TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL) WITHOUT ROWID;
-                    PRAGMA application_id = 1163283779; PRAGMA user_version = 3;")?;
-                transaction.commit()?;
-            } else if application_id != APPLICATION_ID || version != 3 {
+            } else if application_id != APPLICATION_ID || !(1..=SCHEMA_VERSION).contains(&version) {
                 return Err(
                     "Unsupported index database version; existing file was preserved".into(),
                 );
+            }
+            if version < SCHEMA_VERSION {
+                let transaction = connection.transaction()?;
+                transaction.execute_batch("DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS state;
+                    CREATE TABLE files (path BLOB PRIMARY KEY NOT NULL, metadata BLOB NOT NULL) WITHOUT ROWID;
+                    CREATE TABLE state (key TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL) WITHOUT ROWID;")?;
+                transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.commit()?;
             }
             let saved: Option<Vec<u8>> = connection
                 .query_row(

@@ -1285,7 +1285,7 @@ mod tests {
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
-    use crate::index_db::Database;
+    use crate::index_db::{Database, SCHEMA_VERSION};
     use std::{
         fs,
         os::unix::{ffi::OsStringExt, fs::PermissionsExt},
@@ -1612,7 +1612,114 @@ mod persistence_tests {
     }
 
     #[test]
-    fn rejects_old_versions_without_losing_files_and_rejects_stale_roots() {
+    fn old_versions_rebuild_and_save_the_current_format() {
+        for version in 1..SCHEMA_VERSION {
+            let fixture = fixture();
+            let root = fixture.join("files");
+            fs::create_dir(&root).unwrap();
+            let file = root.join("file");
+            fs::write(&file, b"keep this file").unwrap();
+            let path = fixture.join("cache/index.sqlite3");
+            fs::create_dir(path.parent().unwrap()).unwrap();
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection.execute_batch("CREATE TABLE files (path BLOB PRIMARY KEY NOT NULL, metadata BLOB NOT NULL) WITHOUT ROWID;
+                PRAGMA application_id = 1163283779;").unwrap();
+            connection
+                .pragma_update(None, "user_version", version)
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO files VALUES (?1, ?2)",
+                    rusqlite::params![
+                        root.join("stale").as_os_str().as_bytes(),
+                        b"[false,3,null]".as_slice()
+                    ],
+                )
+                .unwrap();
+            // Recreating tables must also handle a different old schema.
+            connection
+                .execute_batch("ALTER TABLE files ADD COLUMN legacy INTEGER NOT NULL DEFAULT 1;")
+                .unwrap();
+            if version >= 2 {
+                connection.execute_batch("CREATE TABLE state (key TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL) WITHOUT ROWID;").unwrap();
+                let checkpoint = Checkpoint {
+                    roots: Vec::new(),
+                    excluded: Vec::new(),
+                    event_ids: vec![123],
+                    verified_at: 123,
+                    errors: Vec::new(),
+                };
+                connection
+                    .execute(
+                        "INSERT INTO state VALUES ('checkpoint', ?1)",
+                        [serde_json::to_vec(&checkpoint).unwrap()],
+                    )
+                    .unwrap();
+            }
+            drop(connection);
+
+            let mut database = Database::open(Some(&path));
+            assert!(database.warning.is_none(), "{:?}", database.warning);
+            assert!(database.load(&[root.clone()]).is_empty());
+            assert!(database.checkpoint.is_none());
+            drop(database);
+            let index = Index::start(vec![root.clone()], Some(path.clone()), Vec::new());
+            let built = wait(&index, |s| s.entries.len() == 2);
+            assert!(built.warning.is_none(), "{:?}", built.warning);
+            assert_eq!(built.full_scans, 1);
+            assert!(!built.replayed);
+            let mut database = Database::open(Some(&path));
+            let cached = database.load(&[root]);
+            assert_eq!(cached.len(), 2);
+            assert_eq!(cached[&file].as_ref(), &bulk::metadata(&file).unwrap());
+            assert_eq!(fs::read(&file).unwrap(), b"keep this file");
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            drop(connection);
+            drop(database);
+            drop(index);
+            fs::remove_dir_all(fixture).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_old_version_reset_preserves_rows_and_version() {
+        let fixture = fixture();
+        let path = fixture.join("index.sqlite3");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE files (path BLOB PRIMARY KEY NOT NULL, metadata BLOB NOT NULL) WITHOUT ROWID;
+            INSERT INTO files VALUES (X'2F66696C65', X'5B66616C73652C332C6E756C6C5D');
+            CREATE VIEW state AS SELECT 'checkpoint' AS key, X'7B7D' AS value;
+            PRAGMA application_id = 1163283779; PRAGMA user_version = 2;").unwrap();
+        let database = Database::open(Some(&path));
+        assert!(database.warning.as_ref().unwrap().contains("view"));
+        for table in ["files", "state"] {
+            assert_eq!(
+                connection
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        drop(database);
+        drop(connection);
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn rejects_future_versions_without_losing_files_and_rejects_stale_roots() {
         let fixture = fixture();
         let root = fixture.join("files");
         fs::create_dir(&root).unwrap();
@@ -1625,7 +1732,7 @@ mod persistence_tests {
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection.busy_timeout(Duration::from_secs(3)).unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 1;")
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
         drop(index);
         let mut database = Database::open(Some(&path));
@@ -1646,7 +1753,10 @@ mod persistence_tests {
             2
         );
         connection
-            .execute_batch("PRAGMA user_version = 3; DELETE FROM state WHERE key = 'checkpoint';")
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .unwrap();
+        connection
+            .execute_batch("DELETE FROM state WHERE key = 'checkpoint';")
             .unwrap();
         fs::write(root.join("new"), b"new").unwrap();
         let index = Index::start(vec![root.clone()], Some(path.clone()), Vec::new());
