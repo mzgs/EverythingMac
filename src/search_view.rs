@@ -856,11 +856,11 @@ impl Render for SearchView {
             .children(self.error.clone().map(|error| div().id("search-error").test_support().role(Role::Status).aria_label(error.clone())
                 .mx_5().mb_3().px_3().py_2().rounded_md().bg(cx.theme().danger.opacity(0.08)).flex().items_center().gap_2().text_sm().text_color(cx.theme().danger)
                 .child(Icon::new(IconName::CircleAlert).small().flex_shrink_0()).child(div().flex_1().min_w_0().child(error))))
-            .child(div().flex().items_center().px_5().border_y_1().border_color(cx.theme().border).bg(cx.theme().muted).text_color(cx.theme().muted_foreground)
+            .child(div().flex().items_center().px_3().border_y_1().border_color(cx.theme().border).bg(cx.theme().muted).text_color(cx.theme().muted_foreground)
                 .child(self.heading("Name", Sort::Name, 280., cx))
                 .child(div().flex_1().min_w_0().child(self.heading("Path", Sort::Path, 140., cx)))
                 .child(self.heading("Size", Sort::Size, 90., cx))
-                .child(div().w(px(90.)).text_sm().py_2().child("Type"))
+                .child(div().w(px(90.)).text_sm().py_1().child("Type"))
                 .child(self.heading("Modified", Sort::Modified, 110., cx)))
             .child(div().id("results-table").test_support().track_focus(&self.results_focus).key_context("FileResults")
                 .on_action(cx.listener(|this, _: &SelectAllResults, _, cx| this.select_all(cx)))
@@ -882,7 +882,7 @@ impl Render for SearchView {
                         let action_context = action_context.clone();
                         let menu_path = entry.path.clone();
                         div().id(("result", i)).test_support().role(Role::Row).aria_label(entry.path.to_string_lossy().into_owned())
-                            .aria_selected(selected_paths.contains(&entry.path)).flex().items_center().h(px(36.)).px_5().text_sm().w_full().cursor_pointer()
+                            .aria_selected(selected_paths.contains(&entry.path)).flex().items_center().h_6().px_3().text_sm().w_full().cursor_pointer()
                             .when(i % 2 == 1, |row| row.bg(cx.theme().table_even))
                             .hover(|row| row.bg(if selected_paths.contains(&entry.path) { cx.theme().selection } else { cx.theme().table_hover }))
                             .when(selected_paths.contains(&entry.path), |row| row.bg(cx.theme().selection))
