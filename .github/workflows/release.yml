@@ -1,0 +1,106 @@
+name: Release
+run-name: Release ${{ inputs.commit }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Pushed commit to release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+      - name: Read version and reject an existing tag
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag=$(python3 -c 'import tomllib; print("v" + tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          tags=$(gh api --paginate 'repos/{owner}/{repo}/git/matching-refs/tags/' --jq '.[].ref')
+          if printf '%s\n' "$tags" | grep -Fxq "refs/tags/$tag"; then
+            echo "Tag $tag already exists; bump the version in Cargo.toml first." >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Check release script
+        run: python3 tests/release_test.py
+      - name: Build app bundle
+        run: ./build.sh
+      - name: Package app and checksum
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          test "$(uname -m)" = "$ARCH"
+          mkdir -p dist
+          archive="EverythingMac-$TAG-macos-$ARCH.zip"
+          ditto -c -k --sequesterRsrc --keepParent 'target/release/Everything Mac.app' "dist/$archive"
+          cd dist
+          shasum -a 256 "$archive" > "$archive.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-macos-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify checksums and publish release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: |
+          sha256sum -c ./*.sha256
+          gh release create "$TAG" ./*.zip ./*.sha256 \
+            --target "$COMMIT" --title "Everything Mac $TAG" --generate-notes \
+            --notes 'macOS ARM64 and Intel x86_64 builds. Ad-hoc signed; not Developer ID signed or notarized.'

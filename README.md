@@ -25,8 +25,11 @@ GPUI Fast's scroll-tile cache is disabled at startup because version 0.1.6 can o
 
 ## GitHub release
 
-Install [GitHub CLI](https://cli.github.com/) (`brew install gh`) and authenticate
-with `gh auth login`. Set the release version in `Cargo.toml`, update `Cargo.lock`
+Install [GitHub CLI](https://cli.github.com/) (`brew install gh`). The script uses
+the GitHub token already stored in the HTTPS origin URL in `.git/config`
+(`https://USERNAME:TOKEN@github.com/OWNER/REPO.git`), without printing it or saving
+it in GitHub CLI's configuration. The token needs repository access and permission
+to run Actions workflows. Set the release version in `Cargo.toml`, update `Cargo.lock`
 with `rustup run stable cargo check`, then commit and push your changes to GitHub.
 From a clean checkout, run:
 
@@ -34,11 +37,20 @@ From a clean checkout, run:
 ./release.sh
 ```
 
-This builds the app, creates an architecture-labeled ZIP and SHA-256 checksum in
-`target/release`, and [publishes a GitHub release](https://cli.github.com/manual/gh_release_create)
-with generated notes and a `v<version>` tag at the current commit. The commit must
-already be on GitHub and the tag must be new. It does not commit or push your code.
-The download is ad-hoc signed and not notarized; macOS may block it on other Macs.
+This [dispatches](https://cli.github.com/manual/gh_workflow_run)
+`.github/workflows/release.yml` on the current pushed branch, with the exact current
+commit as an input. The workflow must already exist on GitHub's default branch.
+GitHub Actions builds macOS ARM64 and Intel x86_64 app bundles on separate runners,
+packages each as a ZIP with a SHA-256 checksum, then creates a `v<version>` GitHub
+release with generated notes after both builds succeed. An existing tag is rejected
+before building. Publishing uses Actions' built-in token with `contents: write`;
+your local token is only used to dispatch the workflow.
+
+The commit must already be on GitHub and the tag must be new. The script does not
+commit, push, or build locally. Windows x86_64 and Linux x86_64 releases require an
+app port first: indexing, file actions, clipboard, and previews currently use
+macOS-only APIs. Downloads are ad-hoc signed and not notarized; macOS may block them
+on other Macs.
 
 Check the release script without building the app or contacting GitHub:
 `python3 tests/release_test.py`.
