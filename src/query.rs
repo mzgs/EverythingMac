@@ -44,7 +44,7 @@ impl Query {
             pos: 0,
             match_case,
             match_path,
-            fuzzy,
+            fuzzy: fuzzy && !match_case,
         };
         let phrase = if !match_path && parser.tokens.len() > 1 {
             parser
@@ -765,7 +765,7 @@ mod tests {
             ("annual", "annual-report.pdf", false, 2),
             ("annual", "old-annual.pdf", false, 3),
             ("annual", "anual.pdf", false, 4),
-            ("annual", "Annual", true, 4),
+            ("annual", "Annual", true, 5),
             ("résumé", "RÉSUMÉ", false, 1),
             ("résumé", "réumé.pdf", false, 4),
             ("annual report", "annual report", false, 1),
@@ -802,6 +802,28 @@ mod tests {
                 .unwrap()
                 .matches(Path::new("folder.pdf"), true, 0, None)
         );
+    }
+
+    #[test]
+    fn case_sensitive_search_does_not_treat_case_differences_as_typos() {
+        for (text, name, expected) in [
+            ("Annual", "annual.pdf", false),
+            ("annual", "Annual.pdf", false),
+            ("annual", "annUal.pdf", false),
+            ("annual", "annuaL.pdf", false),
+            ("Résumé", "résumé.pdf", false),
+            ("annual", "annual.pdf", true),
+            ("Annual", "Annual.pdf", true),
+            ("annual", "anual.pdf", false),
+            ("!Annual", "annual.pdf", true),
+        ] {
+            let query = Query::parse(text, true, false, false, true).unwrap();
+            assert_eq!(
+                query.matches(Path::new(name), false, 0, None),
+                expected,
+                "{text}: {name}"
+            );
+        }
     }
 
     #[test]

@@ -385,7 +385,7 @@ async fn folder_scope_and_saved_searches_restore_options_after_reopening(cx: &mu
         assert_eq!(window.find("search-input").value(), Some(""));
         window.click("case", cx);
         window.click(("filter", 6usize), cx);
-        type_query(window, cx, "alpa");
+        type_query(window, cx, "alpha");
         window.click("Modified", cx);
         window.click("Modified", cx);
     })
@@ -398,7 +398,7 @@ async fn folder_scope_and_saved_searches_restore_options_after_reopening(cx: &mu
         window.press("space", cx);
         assert_eq!(window.find("saved-search-name").focused(), Some(true));
         assert_eq!(window.find("saved-search-name").value(), Some("Archived "));
-        assert_eq!(window.find("search-input").value(), Some("alpa"));
+        assert_eq!(window.find("search-input").value(), Some("alpha"));
         window.input("documents", cx);
         window.click("save-search", cx);
         assert!(window.try_find("saved-searches").is_none());
@@ -430,7 +430,7 @@ async fn folder_scope_and_saved_searches_restore_options_after_reopening(cx: &mu
         );
         window.click(("saved-search", 0usize), cx);
         assert!(window.try_find("saved-searches").is_none());
-        assert_eq!(window.find("search-input").value(), Some("alpa"));
+        assert_eq!(window.find("search-input").value(), Some("alpha"));
         assert_eq!(window.find("search-input").focused(), Some(true));
         assert!(window.try_find("fuzzy").is_none());
         assert_eq!(window.find("case").checked(), Some(true));
@@ -1011,6 +1011,40 @@ async fn search_filters_invalid_queries_latest_input_and_keyboard_selection(
         );
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+async fn case_toggle_filters_existing_results(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    cx.update_window(handle, |_, window, cx| {
+        type_query(window, cx, "Alpha");
+    })
+    .unwrap();
+    wait_count(cx, handle, 2).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click("case", cx);
+        assert_eq!(window.find("case").checked(), Some(true));
+    })
+    .unwrap();
+    wait_count(cx, handle, 0).await;
+    cx.update_window(handle, |_, window, cx| {
+        type_query(window, cx, "alpha");
+    })
+    .unwrap();
+    wait_count(cx, handle, 2).await;
+    cx.update_window(handle, |_, window, cx| {
+        type_query(window, cx, "Alpha");
+    })
+    .unwrap();
+    wait_count(cx, handle, 0).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click("case", cx);
+        assert_eq!(window.find("case").checked(), Some(false));
+    })
+    .unwrap();
+    wait_count(cx, handle, 2).await;
 }
 
 #[gpui_kit::test]
