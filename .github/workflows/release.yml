@@ -30,15 +30,17 @@ jobs:
       - name: Read version and reject an existing tag
         id: version
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           tag=$(python3 -c 'import tomllib; print("v" + tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
-          tags=$(gh api --paginate 'repos/{owner}/{repo}/git/matching-refs/tags/' --jq '.[].ref')
-          if printf '%s\n' "$tags" | grep -Fxq "refs/tags/$tag"; then
-            echo "Tag $tag already exists; bump the version in Cargo.toml first." >&2
-            exit 1
-          fi
+          status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GITHUB_TOKEN" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/ref/tags/$tag")
+          case "$status" in
+            404) ;;
+            200) echo "Tag $tag already exists; bump the version in Cargo.toml first." >&2; exit 1 ;;
+            *) echo "GitHub tag check failed (HTTP $status)." >&2; exit 1 ;;
+          esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
@@ -95,12 +97,28 @@ jobs:
       - name: Verify checksums and publish release
         working-directory: dist
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
           TAG: ${{ needs.prepare.outputs.tag }}
           COMMIT: ${{ needs.prepare.outputs.commit }}
         run: |
           sha256sum -c ./*.sha256
-          gh release create "$TAG" ./*.zip ./*.sha256 \
-            --target "$COMMIT" --title "Everything Mac $TAG" --generate-notes \
-            --notes 'macOS ARM64 and Intel x86_64 builds. Ad-hoc signed; not Developer ID signed or notarized.'
+          api="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases"
+          payload=$(jq -n --arg tag "$TAG" --arg commit "$COMMIT" \
+            '{tag_name: $tag, target_commitish: $commit, name: ("Everything Mac " + $tag),
+              body: "macOS ARM64 and Intel x86_64 builds. Ad-hoc signed; not Developer ID signed or notarized.",
+              generate_release_notes: true, draft: true}')
+          release=$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GITHUB_TOKEN" \
+            --header 'Content-Type: application/json' --data "$payload" "$api")
+          id=$(printf '%s' "$release" | jq -er '.id')
+          upload_url=$(printf '%s' "$release" | jq -er '.upload_url | split("{")[0]')
+          for asset in ./*.zip ./*.sha256; do
+            name=$(jq -rn --arg name "${asset##*/}" '$name | @uri')
+            curl --fail --silent --show-error --output /dev/null \
+              --header "Authorization: Bearer $GITHUB_TOKEN" \
+              --header 'Content-Type: application/octet-stream' \
+              --data-binary "@$asset" "$upload_url?name=$name"
+          done
+          curl --fail --silent --show-error --output /dev/null --request PATCH \
+            --header "Authorization: Bearer $GITHUB_TOKEN" \
+            --header 'Content-Type: application/json' --data '{"draft":false}' "$api/$id"

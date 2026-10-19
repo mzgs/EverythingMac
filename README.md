@@ -25,11 +25,11 @@ GPUI Fast's scroll-tile cache is disabled at startup because version 0.1.6 can o
 
 ## GitHub release
 
-Install [GitHub CLI](https://cli.github.com/) (`brew install gh`). The script uses
+The script requires `curl` and Python 3; GitHub CLI is not needed. It uses
 the GitHub token already stored in the HTTPS origin URL in `.git/config`
-(`https://USERNAME:TOKEN@github.com/OWNER/REPO.git`), without printing it or saving
-it in GitHub CLI's configuration. The token needs repository access and permission
-to run Actions workflows. Set the release version in `Cargo.toml`, update `Cargo.lock`
+(`https://USERNAME:TOKEN@github.com/OWNER/REPO.git`), without printing it.
+The token needs repository access and permission to run Actions workflows.
+Set the release version in `Cargo.toml`, update `Cargo.lock`
 with `rustup run stable cargo check`, then commit and push your changes to GitHub.
 From a clean checkout, run:
 
@@ -37,14 +37,16 @@ From a clean checkout, run:
 ./release.sh
 ```
 
-This [dispatches](https://cli.github.com/manual/gh_workflow_run)
+This [dispatches through GitHub's REST API](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event)
 `.github/workflows/release.yml` on the current pushed branch, with the exact current
 commit as an input. The workflow must already exist on GitHub's default branch.
 GitHub Actions builds macOS ARM64 and Intel x86_64 app bundles on separate runners,
 packages each as a ZIP with a SHA-256 checksum, then creates a `v<version>` GitHub
-release with generated notes after both builds succeed. An existing tag is rejected
-before building. Publishing uses Actions' built-in token with `contents: write`;
+release with generated notes after both builds succeed and all assets upload.
+An existing tag is rejected before building. Publishing uses Actions' built-in token with `contents: write`;
 your local token is only used to dispatch the workflow.
+If an upload fails, the release stays a draft; remove that draft in GitHub before
+retrying the same version.
 
 The commit must already be on GitHub and the tag must be new. The script does not
 commit, push, or build locally. Windows x86_64 and Linux x86_64 releases require an
