@@ -23,6 +23,26 @@ The bundle is built for the current Mac's architecture. It is not Developer ID s
 
 GPUI Fast's scroll-tile cache is disabled at startup because version 0.1.6 can overflow its tile coordinates in large/HiDPI result lists. Rows remain virtualized. The separate Cargo future-compatibility warning for `block 0.1.6` is an upstream dependency warning, not this rendering panic.
 
+## GitHub release
+
+Install [GitHub CLI](https://cli.github.com/) (`brew install gh`) and authenticate
+with `gh auth login`. Set the release version in `Cargo.toml`, update `Cargo.lock`
+with `rustup run stable cargo check`, then commit and push your changes to GitHub.
+From a clean checkout, run:
+
+```sh
+./release.sh
+```
+
+This builds the app, creates an architecture-labeled ZIP and SHA-256 checksum in
+`target/release`, and [publishes a GitHub release](https://cli.github.com/manual/gh_release_create)
+with generated notes and a `v<version>` tag at the current commit. The commit must
+already be on GitHub and the tag must be new. It does not commit or push your code.
+The download is ad-hoc signed and not notarized; macOS may block it on other Macs.
+
+Check the release script without building the app or contacting GitHub:
+`python3 tests/release_test.py`.
+
 ## Search
 
 Your home folder is indexed by default. Open **Everything Mac → Settings…** (`⌘,`) to add/remove folders or mounted volumes, then save. **Rebuild cache** is also available in this settings dialog to rescan the saved indexed folders. Use **Exclude folders…** in the same dialog to skip specific folders and their contents; save to apply. Exclusions also remove cached results and apply to live updates. Removing an exclusion rescans the indexed folders. Existing settings default to no custom exclusions. Nested roots are deduplicated by the indexer. Hidden files are included; symbolic links are listed without following them. Names, sizes and modified times are scanned in the background; file contents are never read by the indexer.

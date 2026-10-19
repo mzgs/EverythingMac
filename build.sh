@@ -8,7 +8,9 @@ if [ "$(uname -s)" != Darwin ]; then
     exit 1
 fi
 
-rustup run stable cargo build --release --target-dir target
+package=$(rustup run stable cargo pkgid --locked)
+version=${package##*@}
+rustup run stable cargo build --locked --release --target-dir target
 
 bundle="target/release/Everything Mac.app"
 identifier="local.$(printf '%s' "$app_name" | tr '_' '-')"
@@ -27,8 +29,8 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 <key>CFBundleIdentifier</key><string>$identifier</string>
 <key>CFBundleExecutable</key><string>$app_name</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleVersion</key><string>0.1.0</string>
-<key>CFBundleShortVersionString</key><string>0.1.0</string>
+<key>CFBundleVersion</key><string>$version</string>
+<key>CFBundleShortVersionString</key><string>$version</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSDocumentsFolderUsageDescription</key><string>Index filenames and metadata in Documents so you can find your files.</string>
 <key>NSDesktopFolderUsageDescription</key><string>Index filenames and metadata on your Desktop so you can find your files.</string>
