@@ -1496,7 +1496,7 @@ impl Render for SearchView {
                             .hover(|row| row.bg(if selected_paths.contains(&entry.path) { cx.theme().selection } else { cx.theme().table_hover }))
                             .when(selected_paths.contains(&entry.path), |row| row.bg(cx.theme().selection))
                             .child(div().w(px(280.)).flex_shrink_0().pr_3().flex().items_center().gap_2()
-                                .child(Icon::new(if entry.is_dir { IconName::Folder } else { IconName::File }).small().flex_shrink_0()
+                                .child(Icon::new(file_icon(entry)).small().flex_shrink_0()
                                     .text_color(if entry.is_dir { cx.theme().link } else { cx.theme().muted_foreground }))
                                 .child(div().min_w_0().truncate().child(group.map_or_else(|| name.clone(), |group| format!("#{group}  {name}")))))
                             .child(div().id(("result-path", i)).test_support().flex_1().min_w_0().pr_3().truncate().text_color(cx.theme().muted_foreground).child(parent.clone())
@@ -1611,6 +1611,37 @@ impl Render for SearchView {
                 .child(div().id("navigation-hints").test_support().text_xs().text_color(cx.theme().muted_foreground).child("↑ ↓ Navigate    Space Quick Look    ↵ Open    ⌘ ↵ Reveal"))))
             .children(self.snapshot.warning.clone().map(|warning| div().id("index-warnings").test_support().role(Role::Status).aria_label(warning.clone()).max_h(px(80.)).overflow_y_scroll().px_5().pb_2().bg(cx.theme().status_bar).text_xs().text_color(cx.theme().muted_foreground).child(warning)))
             .into_any_element()
+    }
+}
+
+fn file_icon(entry: &Entry) -> IconName {
+    if entry.is_dir {
+        return IconName::Folder;
+    }
+    let extension = entry
+        .path
+        .extension()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.to_str().unwrap_or_default() {
+        "mp3" | "m4a" | "aac" | "flac" | "wav" | "aiff" | "ogg" | "opus" => IconName::Music2,
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "heic" | "heif" | "tif" | "tiff" | "bmp"
+        | "svg" | "raw" | "ico" | "avif" => IconName::Image,
+        "mp4" | "mov" | "mkv" | "avi" | "webm" | "m4v" | "mpeg" | "mpg" => IconName::Video,
+        "pdf" | "doc" | "docx" | "txt" | "md" | "rtf" | "pages" | "odt" | "log" => {
+            IconName::FileText
+        }
+        "xls" | "xlsx" | "csv" | "tsv" | "numbers" | "ods" => IconName::FileSpreadsheet,
+        "ppt" | "pptx" | "key" | "odp" => IconName::Presentation,
+        "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" | "tgz" | "zst" => IconName::FileArchive,
+        "rs" | "swift" | "c" | "h" | "cpp" | "hpp" | "m" | "mm" | "py" | "js" | "jsx" | "ts"
+        | "tsx" | "html" | "css" | "scss" | "json" | "xml" | "yaml" | "yml" | "toml" | "java"
+        | "kt" | "go" | "rb" | "php" | "sql" => IconName::FileCode,
+        "sh" | "bash" | "zsh" | "fish" | "command" | "bat" | "ps1" => IconName::Terminal,
+        "db" | "sqlite" | "sqlite3" => IconName::Database,
+        "dmg" | "iso" | "img" => IconName::HardDrive,
+        "ttf" | "otf" | "woff" | "woff2" => IconName::FileType,
+        _ => IconName::File,
     }
 }
 
@@ -1730,8 +1761,9 @@ fn format_modified(time: Option<SystemTime>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchView, format_count, format_size, kind_matches, move_to_trash};
+    use super::{SearchView, file_icon, format_count, format_size, kind_matches, move_to_trash};
     use crate::{index::Entry, settings::Settings};
+    use gpui_kit::assets::IconName;
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
     use gpui_kit::{AppContext, ScrollStrategy, TestAppContext};
     use std::{path::PathBuf, sync::Arc};
@@ -2866,6 +2898,43 @@ mod tests {
             (1_500_000_000, "1.5B"),
         ] {
             assert_eq!(format_count(count), expected);
+        }
+    }
+
+    #[test]
+    fn file_icons_distinguish_types_and_preserve_folders_and_unknown_files() {
+        for (name, expected) in [
+            ("song.MP3", IconName::Music2),
+            ("photo.JpG", IconName::Image),
+            ("movie.mov", IconName::Video),
+            ("report.pdf", IconName::FileText),
+            ("notes.md", IconName::FileText),
+            ("budget.xlsx", IconName::FileSpreadsheet),
+            ("slides.key", IconName::Presentation),
+            ("backup.tar.gz", IconName::FileArchive),
+            ("main.rs", IconName::FileCode),
+            ("view.tsx", IconName::FileCode),
+            ("config.json", IconName::FileCode),
+            ("run.command", IconName::Terminal),
+            ("index.sqlite3", IconName::Database),
+            ("installer.dmg", IconName::HardDrive),
+            ("font.otf", IconName::FileType),
+            ("unknown.xyz", IconName::File),
+            ("README", IconName::File),
+            (".gitignore", IconName::File),
+            ("trailing.", IconName::File),
+        ] {
+            let mut entry = Entry {
+                path: PathBuf::from("/tmp").join(name),
+                is_dir: false,
+                size: 0,
+                allocated_size: 0,
+                modified: None,
+            };
+            assert_eq!(file_icon(&entry), expected, "{name}");
+            assert!(gpui_kit::assets::AllAssets::get(expected.path().as_ref()).is_some());
+            entry.is_dir = true;
+            assert_eq!(file_icon(&entry), IconName::Folder, "{name}");
         }
     }
 
