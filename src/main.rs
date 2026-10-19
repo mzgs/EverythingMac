@@ -1,5 +1,6 @@
 mod bulk;
 mod content_search;
+mod duplicates;
 mod file_actions;
 mod fs_events;
 mod index;
@@ -61,8 +62,10 @@ impl AppView {
             });
             true
         });
+        let search = cx.new(|cx| search_view::SearchView::new(database_path, window, cx));
+        cx.observe(&search, |_, _, cx| cx.notify()).detach();
         Self {
-            search: cx.new(|cx| search_view::SearchView::new(database_path, window, cx)),
+            search,
             window_path,
             window_state,
         }
@@ -82,6 +85,9 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let duplicates = self
+            .search
+            .update(cx, |search, cx| search.duplicates_button(cx));
         div()
             .size_full()
             .flex()
@@ -156,21 +162,23 @@ impl Render for AppView {
                             ),
                     )
                     .child(
-                        Button::new("titlebar-settings")
-                            .ghost()
-                            .small()
-                            .size_7()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .bg(cx.theme().background.opacity(0.55))
-                            .text_color(cx.theme().muted_foreground)
-                            .icon(assets::IconName::Settings)
-                            .accessibility_label("Settings")
-                            .tooltip("Settings · ⌘,")
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(OpenSettings), cx)
-                            }),
+                        div().flex().items_center().gap_2().child(duplicates).child(
+                            Button::new("titlebar-settings")
+                                .ghost()
+                                .small()
+                                .size_7()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .bg(cx.theme().background.opacity(0.55))
+                                .text_color(cx.theme().muted_foreground)
+                                .icon(assets::IconName::Settings)
+                                .accessibility_label("Settings")
+                                .tooltip("Settings · ⌘,")
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(OpenSettings), cx)
+                                }),
+                        ),
                     ),
             )
             .child(div().flex_1().min_h_0().child(self.search.clone()))

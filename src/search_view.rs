@@ -117,6 +117,8 @@ pub(crate) struct SearchView {
     descending: bool,
     searching: bool,
     sorting: bool,
+    finding_duplicates: bool,
+    duplicates: Option<Arc<crate::duplicates::Report>>,
     starting: bool,
     pending_open: Option<bool>,
     error: Option<String>,
@@ -232,6 +234,8 @@ impl SearchView {
             descending: false,
             searching: false,
             sorting: false,
+            finding_duplicates: false,
+            duplicates: None,
             starting,
             pending_open: None,
             error: None,
@@ -621,13 +625,20 @@ impl SearchView {
         if snapshot.revision != self.snapshot.revision {
             self.filter_results.fill_with(|| None);
             self.snapshot = snapshot;
-            if self.search_task.is_none() {
+            if let Some(report) = &mut self.duplicates {
+                let report = Arc::make_mut(report);
+                report.retain_current(&self.snapshot.entries);
+                let results = report.results.clone();
+                self.set_results(results, cx, false);
+            } else if self.search_task.is_none() {
                 self.search(window, cx, false);
             }
         }
     }
 
     fn search(&mut self, window: &mut Window, cx: &mut Context<Self>, reveal_selection: bool) {
+        self.finding_duplicates = false;
+        self.duplicates = None;
         self.search_day = chrono::Local::now().date_naive();
         if reveal_selection {
             self.filter_results.fill_with(|| None);
@@ -813,6 +824,74 @@ impl SearchView {
                 } else {
                     this.search(window, cx, false);
                 }
+            });
+        }));
+        cx.notify();
+    }
+
+    pub(crate) fn duplicates_button(&self, cx: &mut Context<Self>) -> Button {
+        Button::new("find-duplicates")
+            .ghost()
+            .small()
+            .size_7()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background.opacity(0.55))
+            .text_color(cx.theme().muted_foreground)
+            .icon(IconName::Copy)
+            .accessibility_label("Find duplicate files")
+            .tooltip("Find duplicate files")
+            .selected(self.finding_duplicates || self.duplicates.is_some())
+            .toggled(self.finding_duplicates || self.duplicates.is_some())
+            .disabled(
+                self.starting
+                    || self.searching
+                    || self.sorting
+                    || ((self.snapshot.scanning || self.error.is_some())
+                        && !self.finding_duplicates
+                        && self.duplicates.is_none()),
+            )
+            .on_click(cx.listener(|this, _, window, cx| this.find_duplicates(window, cx)))
+    }
+
+    fn find_duplicates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.finding_duplicates || self.duplicates.is_some() {
+            self.search(window, cx, true);
+            return;
+        }
+        if self.starting
+            || self.searching
+            || self.sorting
+            || self.snapshot.scanning
+            || self.error.is_some()
+        {
+            return;
+        }
+        self.filter_results.fill_with(|| None);
+        self.pending_open = None;
+        self.error = None;
+        self.finding_duplicates = true;
+        let entries = self.results.clone();
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let current = self.generation.clone();
+        self.search_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let report = cx
+                .background_spawn(
+                    async move { crate::duplicates::find(&entries, &current, generation) },
+                )
+                .await;
+            let Some(mut report) = report else { return };
+            let _ = this.update_in(cx, |this, _, cx| {
+                if this.generation.load(Ordering::Relaxed) != generation {
+                    return;
+                }
+                this.search_task = None;
+                this.finding_duplicates = false;
+                report.retain_current(&this.snapshot.entries);
+                this.set_results(report.results.clone(), cx, true);
+                this.duplicates = Some(Arc::new(report));
+                cx.notify();
             });
         }));
         cx.notify();
@@ -1127,11 +1206,20 @@ impl SearchView {
         width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let duplicates = self.duplicates.is_some();
+        let selected = if duplicates {
+            sort == Sort::Size
+        } else {
+            self.sort == sort
+        };
         Button::new(label)
             .ghost()
             .small()
+            .disabled(self.finding_duplicates || self.duplicates.is_some())
             .accessibility_label(label)
-            .tooltip(if sort == Sort::Size {
+            .tooltip(if duplicates && sort == Sort::Size {
+                "Duplicate groups ordered by logical file size, largest first".to_string()
+            } else if sort == Sort::Size {
                 "Sort by size on disk".to_string()
             } else {
                 format!("Sort by {}", label.to_lowercase())
@@ -1145,11 +1233,11 @@ impl SearchView {
                     .gap_1()
                     .w_full()
                     .child(label)
-                    .when(self.sort == sort, |this| {
+                    .when(selected, |this| {
                         this.child(if self.sorting {
                             Spinner::new().xsmall().into_any_element()
                         } else {
-                            Icon::new(if self.descending {
+                            Icon::new(if duplicates || self.descending {
                                 IconName::ArrowDown
                             } else {
                                 IconName::ArrowUp
@@ -1259,6 +1347,7 @@ impl Render for SearchView {
                 .into_any_element()
         });
         let results = self.results.clone();
+        let duplicates = self.duplicates.clone();
         let selected_paths = self.selected_paths.clone();
         let owner = cx.entity().downgrade();
         let action_context = self.results_focus.clone();
@@ -1292,6 +1381,12 @@ impl Render for SearchView {
                     "Searching your index…"
                 },
                 "Finding files and folders that match your search.",
+            )
+        } else if self.duplicates.is_some() {
+            (
+                IconName::SearchX,
+                "No duplicates found",
+                "No identical files were confirmed in this search. Turn Duplicates off to return to all results.",
             )
         } else if self.content {
             (
@@ -1344,6 +1439,13 @@ impl Render for SearchView {
                 .child(div().flex_1().min_w_0().truncate().child(format!("Within: {}", scope.display())))
                 .child(Button::new("clear-scope").ghost().small().icon(IconName::X).accessibility_label("Clear folder scope").tooltip("Search all indexed folders").on_click(cx.listener(|this, _, window, cx| this.set_scope(None, window, cx))))))
             .when(self.content, |this| this.child(div().id("content-search-note").test_support().role(Role::Status).aria_label("Content search uses Spotlight").mx_5().mb_3().text_xs().text_color(cx.theme().muted_foreground).child("Search inside files: text or * / ? wildcards. Spotlight may omit unindexed files or recent edits.")))
+            .when(self.finding_duplicates, |this| this.child(div().id("duplicate-progress").test_support().role(Role::Status).aria_label("Comparing matching files for duplicates").mx_5().mb_3().flex().items_center().gap_2().text_sm()
+                .child(Spinner::new().small()).child(div().flex_1().child("Comparing matching files for duplicates…"))
+                .child(Button::new("cancel-duplicates").ghost().small().label("Cancel").on_click(cx.listener(|this, _, window, cx| this.search(window, cx, true))))))
+            .children(self.duplicates.clone().map(|report| div().id("duplicate-summary").test_support().role(Role::Status).aria_label(format!("{} duplicate groups, {} files, {} skipped", report.group_ends.len(), report.results.len(), report.skipped)).mx_5().mb_3().flex().flex_col().gap_1().text_xs().text_color(cx.theme().muted_foreground)
+                .child(format!("{} duplicate groups · {} files · {} skipped. Scan snapshot; turn Duplicates off to search again. Hard links count once.", format_count(report.group_ends.len()), format_count(report.results.len()), format_count(report.skipped)))
+                .children(report.warning.clone())
+                .child(Button::new("close-duplicates").ghost().small().label("Back to search").on_click(cx.listener(|this, _, window, cx| this.search(window, cx, true))))))
             .children(self.error.clone().map(|error| div().id("search-error").test_support().role(Role::Status).aria_label(error.clone())
                 .mx_5().mb_3().px_3().py_2().rounded_md().bg(cx.theme().danger.opacity(0.08)).flex().items_center().gap_2().text_sm().text_color(cx.theme().danger)
                 .child(Icon::new(IconName::CircleAlert).small().flex_shrink_0()).child(div().flex_1().min_w_0().child(error))))
@@ -1367,6 +1469,7 @@ impl Render for SearchView {
                         let name = entry.path.file_name().unwrap_or(entry.path.as_os_str()).to_string_lossy().into_owned();
                         let parent = entry.path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
                         let kind = if entry.is_dir { "Folder".into() } else { entry.path.extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_else(|| "File".into()) };
+                        let group = duplicates.as_ref().map(|report| report.group_ends.partition_point(|end| *end <= i) + 1);
                         let owner = owner.clone();
                         let click_owner = owner.clone();
                         let mouse_owner = owner.clone();
@@ -1374,7 +1477,7 @@ impl Render for SearchView {
                         let action_context = action_context.clone();
                         let menu_path = entry.path.clone();
                         let is_directory = entry.is_dir;
-                        div().id(("result", i)).test_support().role(Role::Row).aria_label(entry.path.to_string_lossy().into_owned())
+                        div().id(("result", i)).test_support().role(Role::Row).aria_label(group.map_or_else(|| entry.path.to_string_lossy().into_owned(), |group| format!("Duplicate group {group}: {}", entry.path.display())))
                             .aria_selected(selected_paths.contains(&entry.path)).flex().items_center().h_6().px_3().text_sm().w_full().cursor_pointer()
                             .when(i % 2 == 1, |row| row.bg(cx.theme().table_even))
                             .hover(|row| row.bg(if selected_paths.contains(&entry.path) { cx.theme().selection } else { cx.theme().table_hover }))
@@ -1382,7 +1485,7 @@ impl Render for SearchView {
                             .child(div().w(px(280.)).flex_shrink_0().pr_3().flex().items_center().gap_2()
                                 .child(Icon::new(if entry.is_dir { IconName::Folder } else { IconName::File }).small().flex_shrink_0()
                                     .text_color(if entry.is_dir { cx.theme().link } else { cx.theme().muted_foreground }))
-                                .child(div().min_w_0().truncate().child(name)))
+                                .child(div().min_w_0().truncate().child(group.map_or_else(|| name.clone(), |group| format!("#{group}  {name}")))))
                             .child(div().flex_1().min_w_0().pr_3().truncate().text_color(cx.theme().muted_foreground).child(parent))
                             .child(div().w(px(90.)).flex_shrink_0().child(if entry.is_dir { "—".into() } else { format_size(entry.allocated_size) }))
                             .child(div().w(px(90.)).flex_shrink_0().truncate().child(kind))

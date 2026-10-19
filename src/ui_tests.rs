@@ -151,6 +151,110 @@ fn type_query(window: &mut Window, cx: &mut App, query: &str) {
 }
 
 #[gpui_kit::test]
+async fn duplicate_scan_groups_only_matching_files_and_returns_to_live_search(
+    cx: &mut TestAppContext,
+) {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("beta.JPG"), b"differs").unwrap();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    cx.wait_for(handle, Duration::from_secs(10), |window, _| {
+        std::thread::sleep(Duration::from_millis(2));
+        window.find("find-duplicates").disabled() != Some(true)
+    })
+    .await;
+    cx.update_window(handle, |_, window, cx| window.click("find-duplicates", cx))
+        .unwrap();
+    cx.wait_for(handle, Duration::from_secs(5), |window, _| {
+        window.try_find("duplicate-summary").is_some()
+    })
+    .await;
+    wait_count(cx, handle, 3).await;
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(
+            window.find("duplicate-summary").label(),
+            Some("1 duplicate groups, 3 files, 0 skipped")
+        );
+        window.click("Name", cx);
+        assert!(window.try_find("duplicate-summary").is_some());
+        assert!(
+            window
+                .find(("result", 0usize))
+                .label()
+                .unwrap()
+                .starts_with("Duplicate group 1:")
+        );
+        assert_eq!(window.find("find-duplicates").checked(), Some(true));
+        window.click(("result", 0usize), cx);
+        window.click("copy-path", cx);
+        assert!(!cx.read_from_clipboard().unwrap().text().unwrap().is_empty());
+    })
+    .unwrap();
+    fs::remove_file(fixture.root.join("gamma.mp3")).unwrap();
+    wait_count(cx, handle, 2).await;
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(
+            window.find("duplicate-summary").label(),
+            Some("1 duplicate groups, 2 files, 1 skipped")
+        );
+        type_query(window, cx, "alpha");
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.background_executor
+        .advance_clock(Duration::from_millis(100));
+    cx.run_until_parked();
+    wait_count(cx, handle, 2).await;
+    cx.update_window(handle, |_, window, cx| {
+        assert!(window.try_find("duplicate-summary").is_none());
+        window.click("find-duplicates", cx);
+    })
+    .unwrap();
+    cx.wait_for(handle, Duration::from_secs(5), |window, _| {
+        window.try_find("duplicate-summary").is_some()
+    })
+    .await;
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(
+            window.find("duplicate-summary").label(),
+            Some("1 duplicate groups, 2 files, 0 skipped")
+        );
+        window.click("close-duplicates", cx);
+    })
+    .unwrap();
+    wait_count(cx, handle, 2).await;
+    cx.run_until_parked();
+    cx.background_executor
+        .advance_clock(Duration::from_millis(100));
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.click("find-duplicates", cx);
+        window.click("cancel-duplicates", cx);
+    })
+    .unwrap();
+    wait_count(cx, handle, 2).await;
+    cx.update_window(handle, |_, window, cx| type_query(window, cx, "beta"))
+        .unwrap();
+    wait_count(cx, handle, 1).await;
+    cx.update_window(handle, |_, window, cx| window.click("find-duplicates", cx))
+        .unwrap();
+    cx.wait_for(handle, Duration::from_secs(5), |window, _| {
+        window.try_find("duplicate-summary").is_some()
+    })
+    .await;
+    wait_count(cx, handle, 0).await;
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(
+            window.find("duplicate-summary").label(),
+            Some("0 duplicate groups, 0 files, 0 skipped")
+        );
+        window.click("close-duplicates", cx);
+    })
+    .unwrap();
+    wait_count(cx, handle, 1).await;
+}
+
+#[gpui_kit::test]
 async fn date_filters_and_fuzzy_mode_work_in_the_search_ui(cx: &mut TestAppContext) {
     let fixture = Fixture::new();
     let yesterday = chrono::Local::now()
@@ -352,6 +456,16 @@ async fn custom_title_bar_keeps_search_and_settings_accessible(cx: &mut TestAppC
         assert_eq!(titlebar.size.height, px(40.));
         assert!(titlebar.contains(&window.find("app-title").bounds().center()));
         assert!(titlebar.contains(&window.find("titlebar-settings").bounds().center()));
+        let duplicates = window.find("find-duplicates").bounds();
+        let settings = window.find("titlebar-settings").bounds();
+        assert!(titlebar.contains(&duplicates.center()));
+        assert!(duplicates.right() < settings.left());
+        assert_eq!(duplicates.size, settings.size);
+        assert_eq!(duplicates.center().y, settings.center().y);
+        assert_eq!(
+            window.find("find-duplicates").label(),
+            Some("Find duplicate files")
+        );
         assert!(window.find("search-input").bounds().top() >= titlebar.bottom());
         assert!(window.find("result-count").visible());
         assert!(window.try_find("preview-badge").is_none());
