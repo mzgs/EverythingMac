@@ -14,7 +14,8 @@ rustup run stable cargo build --locked --release --target-dir target
 
 bundle="target/release/Everything Mac.app"
 identifier="local.$(printf '%s' "$app_name" | tr '_' '-')"
-mkdir -p "$bundle/Contents/MacOS"
+mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+cp assets/AppIcon.icns "$bundle/Contents/Resources/AppIcon.icns"
 cp "target/release/$app_name" "$bundle/Contents/MacOS/$app_name.new"
 mv "$bundle/Contents/MacOS/$app_name.new" "$bundle/Contents/MacOS/$app_name"
 # The executable's old spelling carries an obsolete bundle signature.
@@ -27,6 +28,7 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 <key>CFBundleDisplayName</key><string>Everything Mac</string>
 <key>CFBundleIdentifier</key><string>$identifier</string>
 <key>CFBundleExecutable</key><string>$app_name</string>
+<key>CFBundleIconFile</key><string>AppIcon.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleVersion</key><string>$version</string>
 <key>CFBundleShortVersionString</key><string>$version</string>

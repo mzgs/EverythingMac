@@ -1,0 +1,10 @@
+Generated with the built-in imagegen tool.
+
+Use case: logo-brand
+Asset type: production macOS application icon for Everything Mac, a fast local file and folder search app.
+Primary request: create one polished, distinctive app icon based on the app's existing blue search symbol.
+Subject: a bold ivory-white magnifying glass with a softly reflective silver rim, its clear lens revealing one simple pale-blue folder silhouette. The magnifying glass is the dominant instantly readable shape, with its short sturdy handle pointing down-right.
+Style/medium: refined native macOS icon, restrained dimensional material rendering, precise geometry, soft bevels and subtle highlights; sophisticated utility app.
+Scene/backdrop: one blue rounded-square app tile, gradient from sky blue at top-left to rich indigo at bottom-right, with restrained depth and a subtle edge.
+Composition/framing: square 1024 by 1024 canvas, straight-on, tile centered with consistent approximately 9 percent transparent margin on all four sides and macOS-style continuous rounded corners. Large centered search symbol, readable at 16px. Fully transparent outside the tile, including corners. No scene or mockup.
+Constraints: single icon only; no lettering, words, numbers, watermark, extra badges, decorative sparkles, multiple icons, Apple logo, desktop or presentation board. Clean silhouette and strong contrast.

@@ -17,7 +17,7 @@ mod ui_tests;
 mod window_state;
 
 use gpui_kit::component::{
-    ActiveTheme, Icon, Sizable, Theme, TitleBar,
+    ActiveTheme, Sizable, Theme, TitleBar,
     button::{Button, ButtonVariants},
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -32,6 +32,7 @@ impl Global for Settings {}
 actions!(base_app, [Quit, OpenSettings]);
 
 struct AppView {
+    app_icon: std::sync::Arc<Image>,
     search: Entity<search_view::SearchView>,
     window_path: Option<std::path::PathBuf>,
     window_state: WindowState,
@@ -65,6 +66,11 @@ impl AppView {
         let search = cx.new(|cx| search_view::SearchView::new(database_path, window, cx));
         cx.observe(&search, |_, _, cx| cx.notify()).detach();
         Self {
+            app_icon: Image::from_bytes(
+                ImageFormat::Png,
+                include_bytes!("../assets/AppIcon.png").to_vec(),
+            )
+            .into(),
             search,
             window_path,
             window_state,
@@ -110,24 +116,7 @@ impl Render for AppView {
                             .flex()
                             .items_center()
                             .gap_3()
-                            .child(
-                                div()
-                                    .size(px(26.))
-                                    .rounded(px(7.))
-                                    .border_1()
-                                    .border_color(white().opacity(0.22))
-                                    .shadow_sm()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .bg(linear_gradient(
-                                        135.,
-                                        linear_color_stop(rgb(0x68b8ff), 0.),
-                                        linear_color_stop(rgb(0x5263e8), 1.),
-                                    ))
-                                    .text_color(rgb(0xffffff))
-                                    .child(Icon::new(assets::IconName::Search).small()),
-                            )
+                            .child(img(self.app_icon.clone()).size_7().flex_shrink_0())
                             .child(
                                 div()
                                     .flex()
