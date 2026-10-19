@@ -4,6 +4,7 @@ use std::{io, path::PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) enum Sort {
+    BestMatch,
     Name,
     Path,
     Size,
@@ -19,6 +20,7 @@ pub(crate) struct SavedSearch {
     pub path: bool,
     pub regex: bool,
     pub content: bool,
+    // Retained for saved-search compatibility; typo tolerance is now automatic.
     pub fuzzy: bool,
     pub scope: Option<PathBuf>,
     pub filter: usize,
@@ -140,7 +142,7 @@ mod tests {
             fuzzy: true,
             scope: Some("/docs".into()),
             filter: 6,
-            sort: Sort::Modified,
+            sort: Sort::BestMatch,
             descending: true,
         }
     }

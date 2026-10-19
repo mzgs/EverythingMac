@@ -64,12 +64,11 @@ impl SearchQuery {
         path: bool,
         regex: bool,
         content: bool,
-        fuzzy: bool,
     ) -> Result<Self, String> {
         if content {
             content_search::predicate(text, case).map(Self::Content)
         } else {
-            Query::parse(text, case, path, regex, fuzzy && !regex).map(Self::Filename)
+            Query::parse(text, case, path, regex, !path && !regex).map(Self::Filename)
         }
     }
 }
@@ -108,7 +107,6 @@ pub(crate) struct SearchView {
     path: bool,
     regex: bool,
     content: bool,
-    fuzzy: bool,
     scope: Option<PathBuf>,
     search_day: chrono::NaiveDate,
     filter: usize,
@@ -225,12 +223,11 @@ impl SearchView {
             path: false,
             regex: false,
             content: false,
-            fuzzy: false,
             scope: None,
             search_day: chrono::Local::now().date_naive(),
             filter: 0,
             filter_results: std::array::from_fn(|_| None),
-            sort: Sort::Path,
+            sort: Sort::BestMatch,
             descending: false,
             searching: false,
             sorting: false,
@@ -263,14 +260,7 @@ impl SearchView {
     }
 
     fn parse_query(&self, text: &str) -> Result<SearchQuery, String> {
-        SearchQuery::parse(
-            text,
-            self.case,
-            self.path,
-            self.regex,
-            self.content,
-            self.fuzzy,
-        )
+        SearchQuery::parse(text, self.case, self.path, self.regex, self.content)
     }
 
     fn save_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -284,7 +274,7 @@ impl SearchView {
             path: self.path,
             regex: self.regex,
             content: self.content,
-            fuzzy: self.fuzzy,
+            fuzzy: true,
             scope: self.scope.clone(),
             filter: self.filter,
             sort: self.sort,
@@ -306,7 +296,6 @@ impl SearchView {
         self.path = saved.path;
         self.regex = saved.regex;
         self.content = saved.content;
-        self.fuzzy = saved.fuzzy;
         self.scope = saved.scope;
         self.filter = saved.filter;
         self.sort = saved.sort;
@@ -653,8 +642,7 @@ impl SearchView {
             return;
         }
         let text = self.input.read(cx).value();
-        let (content, case, path, regex, fuzzy) =
-            (self.content, self.case, self.path, self.regex, self.fuzzy);
+        let (content, case, path, regex) = (self.content, self.case, self.path, self.regex);
         self.error = None;
         self.searching = true;
         let revision = self.snapshot.revision;
@@ -665,6 +653,12 @@ impl SearchView {
         let filter = self.filter;
         let sort = self.sort;
         let descending = self.descending;
+        let needs_sort = descending
+            || match sort {
+                Sort::Path => false,
+                Sort::BestMatch => !text.trim().is_empty() && !content && !regex && !path,
+                _ => true,
+            };
         let current = self.generation.clone();
         self.search_task = Some(cx.spawn_in(window, async move |this, cx| {
             if reveal_selection {
@@ -679,7 +673,7 @@ impl SearchView {
                         return Ok(None);
                     }
                     // Compile only the debounced query, away from keyboard handling.
-                    let query = SearchQuery::parse(&text, case, path, regex, content, fuzzy)?;
+                    let query = SearchQuery::parse(&text, case, path, regex, content)?;
                     let content_paths = match &query {
                         // shortcut: Spotlight changes refresh on the next search; subscribe if live content updates are needed.
                         SearchQuery::Content(predicate) => {
@@ -720,10 +714,10 @@ impl SearchView {
                             results.push(entry.clone());
                         }
                     }
-                    Ok::<_, String>(Some(Arc::new(results)))
+                    Ok::<_, String>(Some((Arc::new(results), query)))
                 })
                 .await;
-            let mut results = match result {
+            let (mut results, query) = match result {
                 Ok(Some(results)) => results,
                 Ok(None) => return,
                 Err(error) => {
@@ -741,7 +735,7 @@ impl SearchView {
                     return;
                 }
             };
-            if (sort != Sort::Path || descending) && results.len() > 1 {
+            if needs_sort && results.len() > 1 {
                 let published = this.update_in(cx, |this, _, cx| {
                     if this.generation.load(Ordering::Relaxed) != generation {
                         return false;
@@ -765,6 +759,21 @@ impl SearchView {
                         let mut results = Arc::unwrap_or_clone(results);
                         // shortcut: an active standard sort finishes on its worker; chunk it if rapid requests cause contention.
                         match sort {
+                            Sort::BestMatch => {
+                                if !regex
+                                    && !path
+                                    && let SearchQuery::Filename(query) = &query
+                                {
+                                    results.sort_by_cached_key(|entry| {
+                                        query.rank(
+                                            &entry.path,
+                                            entry.is_dir,
+                                            entry.size,
+                                            entry.modified,
+                                        )
+                                    });
+                                }
+                            }
                             // Stable sorting keeps equal names in the snapshot's path order.
                             Sort::Name => results.sort_by_cached_key(|e| {
                                 e.path
@@ -926,7 +935,7 @@ impl SearchView {
             self.descending = saved.descending;
             cx.notify();
         } else {
-            self.sort = Sort::Path;
+            self.sort = Sort::BestMatch;
             self.descending = false;
             self.search(window, cx, false);
         }
@@ -1411,7 +1420,7 @@ impl Render for SearchView {
             .on_action(cx.listener(|this, _: &NextResult, window, cx| this.move_selection(1, false, window, cx)))
             .on_action(cx.listener(|this, _: &PreviousResult, window, cx| this.move_selection(-1, false, window, cx)))
             .on_action(cx.listener(|_, _: &SearchHelp, window, cx| crate::settings_view::show_error(
-                "Search filenames as you type.\n\nreport budget — both words\n\"annual report\" — exact phrase\n*.pdf | *.docx — either pattern\n!backup — exclude a word\n<cat | dog> photo — group terms\next:jpg;png — extension filter\nfile: / folder: — kind\npath:Projects — search full path\nsize:>10mb — size filter\nmodified:today — changed today\nmodified:thisweek — changed since Monday\nmodified:>=2026-10-01 — changed on or after October 1, 2026\nmodified:2026-01-01..2026-01-31 — inclusive dates\n\nFuzzy: allow one typo in unquoted filename terms of 4–64 characters. Quotes, wildcards and predicates stay exact.\nSaved: name and restore the query, modes, filter, folder scope and sorting. Right-click a folder → Search here; clear the scope chip to search everywhere. Drag selected files out of the window into another app.\n\nAa: case sensitive. Path: match full paths. Regex: treat the entire query as a regular expression.\n\nContent: search text inside files using Spotlight. Type text or * / ? wildcards; the whole query is a content pattern. Aa controls case. Path, Regex and filename operators apply only to filename search. Results are limited to indexed files; Spotlight coverage and updates may lag.\n\n⌘-click Toggle selection · Shift-click Select range · ⌘A Select all · ⇧↑/↓ Extend selection · ⌘C Copy files · ⌘⌫ Move to Trash\n\n⌘F Search · ↓/↑ Select · Space Quick Look · Return Open · ⌘Return Reveal · ⇧⌘C Copy path · ⌘R Rebuild · ⌘, Folders".into(), window, cx)))
+                "Search filenames as you type.\n\nreport budget — both words\n\"annual report\" — exact phrase\n*.pdf | *.docx — either pattern\n!backup — exclude a word\n<cat | dog> photo — group terms\next:jpg;png — extension filter\nfile: / folder: — kind\npath:Projects — search full path\nsize:>10mb — size filter\nmodified:today — changed today\nmodified:thisweek — changed since Monday\nmodified:>=2026-10-01 — changed on or after October 1, 2026\nmodified:2026-01-01..2026-01-31 — inclusive dates\n\nFilename search automatically allows one typo in unquoted filename terms of 4–64 characters. Quotes, wildcards and predicates stay exact.\nSaved: name and restore the query, modes, filter, folder scope and sorting. Right-click a folder → Search here; clear the scope chip to search everywhere. Drag selected files out of the window into another app.\n\nAa: case sensitive. Path: match full paths. Regex: treat the entire query as a regular expression.\n\nContent: search text inside files using Spotlight. Type text or * / ? wildcards; the whole query is a content pattern. Aa controls case. Path, Regex and filename operators apply only to filename search. Results are limited to indexed files; Spotlight coverage and updates may lag.\n\n⌘-click Toggle selection · Shift-click Select range · ⌘A Select all · ⇧↑/↓ Extend selection · ⌘C Copy files · ⌘⌫ Move to Trash\n\n⌘F Search · ↓/↑ Select · Space Quick Look · Return Open · ⌘Return Reveal · ⇧⌘C Copy path · ⌘R Rebuild · ⌘, Folders".into(), window, cx)))
             .child(div().flex().items_center().gap_2().px_5().pt_4().pb_3()
                 .child(div().flex_1().min_w_0().child(Input::new(&self.input).id("search-input").aria_label(if self.content { "Search file contents" } else { "Search files and folders" })
                 .prefix(self.search_history(window, cx))
@@ -1433,7 +1442,7 @@ impl Render for SearchView {
                     .child(Button::new("case").ghost().small().label("Aa").tooltip("Case sensitive").selected(self.case).toggled(self.case).when(self.case, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.case = !this.case; this.search(window, cx, true); })))
                     .child(Button::new("path").ghost().small().label("Path").tooltip("Search full paths (filename search only)").disabled(self.content).selected(self.path).toggled(self.path).when(self.path, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.path = !this.path; this.search(window, cx, true); })))
                     .child(Button::new("regex").ghost().small().label("Regex").tooltip("Use a regular expression (filename search only)").disabled(self.content).selected(self.regex).toggled(self.regex).when(self.regex, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.regex = !this.regex; this.search(window, cx, true); })))
-                    .child(Button::new("fuzzy").ghost().small().label("Fuzzy").tooltip("Allow one typo in plain filename terms of 4–64 characters; quotes and wildcards stay exact").disabled(self.content || self.regex || self.path).selected(self.fuzzy).toggled(self.fuzzy).when(self.fuzzy, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.fuzzy = !this.fuzzy; this.search(window, cx, true); })))))
+                    ))
             .children(self.scope.clone().map(|scope| div().id("search-scope").test_support().role(Role::Status).aria_label(format!("Searching within {}", scope.display())).mx_5().mb_3().flex().items_center().gap_2().text_sm()
                 .child(Icon::new(IconName::Folder).small())
                 .child(div().flex_1().min_w_0().truncate().child(format!("Within: {}", scope.display())))
@@ -1572,7 +1581,8 @@ impl Render for SearchView {
                             this.path = false;
                             this.regex = false;
                             this.content = false;
-                            this.fuzzy = false;
+                            this.sort = Sort::BestMatch;
+                            this.descending = false;
                             this.scope = None;
                             this.input.update(cx, |input, cx| { input.set_value("", window, cx); input.focus(window, cx); });
                             this.search(window, cx, true);
@@ -1715,6 +1725,115 @@ mod tests {
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
     use gpui_kit::{AppContext, ScrollStrategy, TestAppContext};
     use std::{path::PathBuf, sync::Arc};
+
+    #[gpui_kit::test]
+    async fn default_search_ranks_matches_and_column_sort_still_works(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            cx.set_global(Settings {
+                roots: Vec::new(),
+                excluded: Vec::new(),
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::size(gpui_kit::px(1150.), gpui_kit::px(450.)),
+            |window, cx| {
+                window.set_scroll_layers(false);
+                SearchView::new(None, window, cx)
+            },
+        );
+        window
+            .update(cx, |view, window, cx| {
+                view._poll = gpui_kit::Task::ready(());
+                view.search_task = None;
+                view.snapshot.loaded = true;
+                view.snapshot.entries = Arc::new(
+                    [
+                        "/a/anual.pdf",
+                        "/b/annual-report.pdf",
+                        "/c/annual",
+                        "/d/old-annual.pdf",
+                        "/e/annual.txt",
+                    ]
+                    .map(|path| {
+                        Arc::new(Entry {
+                            path: path.into(),
+                            is_dir: false,
+                            size: 0,
+                            allocated_size: 0,
+                            modified: None,
+                        })
+                    })
+                    .into(),
+                );
+                view.input
+                    .update(cx, |input, cx| input.set_value("annual", window, cx));
+                view.search(window, cx, true);
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("best-match").is_none());
+            assert!(window.try_find("fuzzy").is_none());
+        })
+        .unwrap();
+        window
+            .update(cx, |view, _, _| view.search_task.take().unwrap())
+            .unwrap()
+            .await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(!view.searching && !view.sorting);
+                assert_eq!(
+                    view.results
+                        .iter()
+                        .map(|entry| entry.path.to_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    [
+                        "/c/annual",
+                        "/b/annual-report.pdf",
+                        "/e/annual.txt",
+                        "/d/old-annual.pdf",
+                        "/a/anual.pdf",
+                    ]
+                );
+                assert_eq!(
+                    view.filter_results[0].as_ref().unwrap().sort,
+                    crate::saved_searches::Sort::BestMatch
+                );
+            })
+            .unwrap();
+        for control in ["Name", "Path"] {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.click(control, cx);
+            })
+            .unwrap();
+            window
+                .update(cx, |view, _, _| view.search_task.take().unwrap())
+                .unwrap()
+                .await;
+        }
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.sort, crate::saved_searches::Sort::Path);
+                assert_eq!(view.results[0].path, PathBuf::from("/a/anual.pdf"));
+            })
+            .unwrap();
+        let task = window
+            .update(cx, |view, window, cx| {
+                view.change_filter(1, window, cx);
+                view.search_task.take().unwrap()
+            })
+            .unwrap();
+        task.await;
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.sort, crate::saved_searches::Sort::BestMatch);
+                assert_eq!(view.results[0].path, PathBuf::from("/c/annual"));
+            })
+            .unwrap();
+    }
 
     #[gpui_kit::test]
     async fn deleting_input_does_not_compile_queries_inline_or_publish_stale_errors(
@@ -2495,7 +2614,7 @@ mod tests {
         });
         cx.update_window(window.into(), |_, window, cx| {
             window.click("search-input", cx);
-            window.input("file-049", cx);
+            window.input("\"file-049\"", cx);
         })
         .unwrap();
         cx.wait_for(window.into(), std::time::Duration::from_secs(3), |_, cx| {

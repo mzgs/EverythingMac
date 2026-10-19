@@ -3,12 +3,14 @@ use regex::{Regex, RegexBuilder};
 use std::{path::Path, time::SystemTime};
 
 #[derive(Debug)]
-pub(crate) struct Query(Expr);
+pub(crate) struct Query(Expr, Option<Regex>);
 
 #[derive(Debug)]
 enum Expr {
     All,
     Text(Regex, bool),
+    Fuzzy(Regex, Regex),
+    Extension(Regex),
     Kind(bool),
     Size(u64, u64),
     Modified(Option<SystemTime>, Option<SystemTime>),
@@ -29,13 +31,13 @@ impl Query {
             return Err("Search is too long (maximum 4096 bytes).".into());
         }
         if text.trim().is_empty() {
-            return Ok(Self(Expr::All));
+            return Ok(Self(Expr::All, None));
         }
         if regex_mode {
-            return Ok(Self(Expr::Text(
-                compile(text, match_case)?,
-                match_path || text.contains('/'),
-            )));
+            return Ok(Self(
+                Expr::Text(compile(text, match_case)?, match_path || text.contains('/')),
+                None,
+            ));
         }
         let mut parser = Parser {
             tokens: tokenize(text)?,
@@ -44,11 +46,27 @@ impl Query {
             match_path,
             fuzzy,
         };
+        let phrase = if !match_path && parser.tokens.len() > 1 {
+            parser
+                .tokens
+                .iter()
+                .map(|token| match token {
+                    Token::Word(word, _) if !word.contains([':', '/', '*', '?']) => {
+                        Some(word.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(|words| compile(&regex::escape(&words.join(" ")), match_case))
+                .transpose()?
+        } else {
+            None
+        };
         let expr = parser.or(0)?;
         if parser.pos != parser.tokens.len() {
             return Err("Unexpected '>'. Check search grouping.".into());
         }
-        Ok(Self(expr))
+        Ok(Self(expr, phrase))
     }
 
     pub(crate) fn matches(
@@ -59,6 +77,24 @@ impl Query {
         modified: Option<SystemTime>,
     ) -> bool {
         self.0.matches(path, is_dir, size, modified)
+    }
+
+    pub(crate) fn rank(
+        &self,
+        path: &Path,
+        is_dir: bool,
+        size: u64,
+        modified: Option<SystemTime>,
+    ) -> u8 {
+        let rank = self
+            .0
+            .rank(path, is_dir, size, modified)
+            .filter(|rank| *rank > 0)
+            .unwrap_or(5);
+        self.1
+            .as_ref()
+            .and_then(|phrase| text_rank(phrase, path))
+            .map_or(rank, |phrase_rank| rank.min(phrase_rank))
     }
 }
 
@@ -74,6 +110,21 @@ impl Expr {
                 };
                 regex.is_match(&text.to_string_lossy())
             }
+            Self::Fuzzy(_, regex) => regex.is_match(
+                &path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy(),
+            ),
+            Self::Extension(regex) => {
+                !is_dir
+                    && regex.is_match(
+                        &path
+                            .file_name()
+                            .unwrap_or(path.as_os_str())
+                            .to_string_lossy(),
+                    )
+            }
             Self::Kind(directory) => is_dir == *directory,
             Self::Size(min, max) => !is_dir && size >= *min && size <= *max,
             Self::Modified(min, max) => modified.is_some_and(|time| {
@@ -88,6 +139,57 @@ impl Expr {
             Self::Not(item) => !item.matches(path, is_dir, size, modified),
         }
     }
+
+    fn rank(
+        &self,
+        path: &Path,
+        is_dir: bool,
+        size: u64,
+        modified: Option<SystemTime>,
+    ) -> Option<u8> {
+        match self {
+            Self::Text(regex, false) | Self::Fuzzy(regex, _) => {
+                if let Some(rank) = text_rank(regex, path) {
+                    Some(rank)
+                } else if let Self::Fuzzy(_, approximate) = self {
+                    approximate
+                        .is_match(
+                            &path
+                                .file_name()
+                                .unwrap_or(path.as_os_str())
+                                .to_string_lossy(),
+                        )
+                        .then_some(4)
+                } else {
+                    None
+                }
+            }
+            // A conjunction is only as strong as its weakest filename term.
+            Self::And(items) => items.iter().try_fold(0, |rank, item| {
+                Some(rank.max(item.rank(path, is_dir, size, modified)?))
+            }),
+            Self::Or(items) => items
+                .iter()
+                .filter_map(|item| item.rank(path, is_dir, size, modified))
+                .min_by_key(|rank| if *rank == 0 { 5 } else { *rank }),
+            // Predicates, paths and exclusions filter results without changing relevance.
+            _ => self.matches(path, is_dir, size, modified).then_some(0),
+        }
+    }
+}
+
+fn text_rank(regex: &Regex, path: &Path) -> Option<u8> {
+    let name = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    regex.find(&name).map(|found| {
+        if found.start() == 0 {
+            if found.end() == name.len() { 1 } else { 2 }
+        } else {
+            3
+        }
+    })
 }
 
 fn compile(pattern: &str, match_case: bool) -> Result<Regex, String> {
@@ -260,10 +362,7 @@ impl Parser {
                             .collect::<Vec<_>>()
                             .join("|")
                     );
-                    return Ok(Expr::And(vec![
-                        Expr::Kind(false),
-                        Expr::Text(compile(&pattern, self.match_case)?, false),
-                    ]));
+                    return Ok(Expr::Extension(compile(&pattern, self.match_case)?));
                 }
                 "size" => return size_predicate(value),
                 "modified" | "dm" => return modified_predicate(value, Local::now().date_naive()),
@@ -278,7 +377,7 @@ impl Parser {
         let full_path = self.match_path || text.contains('/');
         if self.fuzzy && !literal && !full_path && !text.contains(['*', '?']) {
             let chars: Vec<_> = text.chars().collect();
-            // shortcut: one typo in 4–64 character plain terms; use a ranked matcher if broader fuzzy search is needed.
+            // shortcut: one typo in 4–64 character plain terms; expand only if broader matching is needed.
             if (4..=64).contains(&chars.len()) {
                 let escaped: Vec<_> = chars
                     .iter()
@@ -299,9 +398,9 @@ impl Parser {
                         ));
                     }
                 }
-                return Ok(Expr::Text(
+                return Ok(Expr::Fuzzy(
+                    compile(&regex::escape(text), self.match_case)?,
                     compile(&format!("(?:{})", patterns.join("|")), self.match_case)?,
-                    false,
                 ));
             }
         }
@@ -655,6 +754,53 @@ mod tests {
                         .unwrap()
                 ))
             )
+        );
+    }
+
+    #[test]
+    fn best_match_ranks_filename_terms_without_ranking_filters() {
+        for (text, name, case, expected) in [
+            ("annual", "annual", false, 1),
+            ("annual", "ANNUAL", false, 1),
+            ("annual", "annual-report.pdf", false, 2),
+            ("annual", "old-annual.pdf", false, 3),
+            ("annual", "anual.pdf", false, 4),
+            ("annual", "Annual", true, 4),
+            ("résumé", "RÉSUMÉ", false, 1),
+            ("résumé", "réumé.pdf", false, 4),
+            ("annual report", "annual report", false, 1),
+            ("annual report", "annual report.pdf", false, 2),
+            ("annual report", "old-annual-report.pdf", false, 3),
+            ("annual report", "annual_reprot.pdf", false, 4),
+            ("\"annual report\" ext:pdf", "annual report.pdf", false, 2),
+            ("name:annual ext:pdf size:>1", "annual.pdf", false, 2),
+            ("annual !backup", "annual.pdf", false, 2),
+            ("<annual | report> ext:pdf", "report.pdf", false, 2),
+            ("<annual ext:txt> | report", "annual.pdf", false, 5),
+            ("annual | file:", "annual", false, 1),
+            ("annual | file:", "other.pdf", false, 5),
+            ("ext:pdf", "annual.pdf", false, 5),
+            ("path:docs annual", "/docs/annual.pdf", false, 2),
+            ("path:annual", "/annual/report.pdf", false, 5),
+            ("annual*", "annual-report.pdf", false, 1),
+            ("", "annual", false, 5),
+        ] {
+            let query = Query::parse(text, case, false, false, true).unwrap();
+            assert_eq!(
+                query.rank(Path::new(name), false, 20, None),
+                expected,
+                "{text}: {name}"
+            );
+            if expected < 5 {
+                assert!(query.matches(Path::new(name), false, 20, None));
+            }
+        }
+        let query = Query::parse("annual", false, false, false, false).unwrap();
+        assert_eq!(query.rank(Path::new("anual.pdf"), false, 0, None), 5);
+        assert!(
+            !Query::parse("ext:pdf", false, false, false, false)
+                .unwrap()
+                .matches(Path::new("folder.pdf"), true, 0, None)
         );
     }
 

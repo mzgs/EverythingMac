@@ -255,7 +255,7 @@ async fn duplicate_scan_groups_only_matching_files_and_returns_to_live_search(
 }
 
 #[gpui_kit::test]
-async fn date_filters_and_fuzzy_mode_work_in_the_search_ui(cx: &mut TestAppContext) {
+async fn date_filters_and_automatic_typo_tolerance_work_in_the_search_ui(cx: &mut TestAppContext) {
     let fixture = Fixture::new();
     let yesterday = chrono::Local::now()
         .date_naive()
@@ -294,15 +294,11 @@ async fn date_filters_and_fuzzy_mode_work_in_the_search_ui(cx: &mut TestAppConte
         type_query(window, cx, "alpa");
     })
     .unwrap();
-    wait_count(cx, handle, 0).await;
-    cx.update_window(handle, |_, window, cx| window.click("fuzzy", cx))
-        .unwrap();
     wait_count(cx, handle, 2).await;
     cx.update_window(handle, |_, window, cx| {
-        assert_eq!(window.find("fuzzy").checked(), Some(true));
+        assert!(window.try_find("fuzzy").is_none());
         window.click("regex", cx);
-        window.click("fuzzy", cx);
-        assert_eq!(window.find("fuzzy").checked(), Some(true));
+        assert!(window.try_find("fuzzy").is_none());
     })
     .unwrap();
     wait_count(cx, handle, 0).await;
@@ -351,7 +347,6 @@ async fn folder_scope_and_saved_searches_restore_options_after_reopening(cx: &mu
             )
         );
         assert_eq!(window.find("search-input").value(), Some(""));
-        window.click("fuzzy", cx);
         window.click("case", cx);
         window.click(("filter", 6usize), cx);
         type_query(window, cx, "alpa");
@@ -377,12 +372,18 @@ async fn folder_scope_and_saved_searches_restore_options_after_reopening(cx: &mu
     })
     .unwrap();
     wait_count(cx, handle, 3).await;
-    let persisted: Vec<crate::saved_searches::SavedSearch> =
+    let mut persisted: Vec<crate::saved_searches::SavedSearch> =
         crate::settings::read_json(&fixture.directory.join("cache/saved-searches.json")).unwrap();
     assert_eq!(persisted.len(), 1);
     assert!(persisted[0].descending);
     assert_eq!(persisted[0].sort, crate::saved_searches::Sort::Modified);
     assert_eq!(persisted[0].filter, 6);
+    persisted[0].fuzzy = false;
+    crate::settings::write_json(
+        &fixture.directory.join("cache/saved-searches.json"),
+        &persisted,
+    )
+    .unwrap();
     let reopened = fixture.open(cx);
     wait_count(cx, reopened, 8).await;
     cx.update_window(reopened, |_, window, cx| {
@@ -395,7 +396,7 @@ async fn folder_scope_and_saved_searches_restore_options_after_reopening(cx: &mu
         assert!(window.try_find("saved-searches").is_none());
         assert_eq!(window.find("search-input").value(), Some("alpa"));
         assert_eq!(window.find("search-input").focused(), Some(true));
-        assert_eq!(window.find("fuzzy").checked(), Some(true));
+        assert!(window.try_find("fuzzy").is_none());
         assert_eq!(window.find("case").checked(), Some(true));
         assert_eq!(window.find(("filter", 6usize)).checked(), Some(true));
         assert!(window.find("search-scope").visible());
