@@ -151,6 +151,42 @@ fn type_query(window: &mut Window, cx: &mut App, query: &str) {
 }
 
 #[gpui_kit::test]
+async fn long_path_tooltip_wraps_inside_the_window(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let parent = fixture.root.join("W".repeat(200));
+    fs::create_dir(&parent).unwrap();
+    fs::write(parent.join("tooltip-target.txt"), b"fixture").unwrap();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 8).await;
+    cx.update_window(handle, |_, window, cx| {
+        type_query(window, cx, "tooltip-target.txt");
+    })
+    .unwrap();
+    wait_count(cx, handle, 1).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.hover(("result-path", 0usize), cx);
+    })
+    .unwrap();
+    cx.wait_for(handle, Duration::from_secs(3), |window, _| {
+        window.try_find("path-tooltip-content").is_some()
+    })
+    .await;
+    cx.update_window(handle, |_, window, _| {
+        let content = window.find("path-tooltip-content");
+        assert_eq!(content.label(), parent.to_str());
+        let bounds = content.bounds();
+        assert!(
+            bounds.size.height > px(40.),
+            "Long paths must wrap: {bounds:?}"
+        );
+        assert!(bounds.size.width <= px(600.));
+        assert!(bounds.left() >= px(0.));
+        assert!(bounds.right() <= window.viewport_size().width);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 async fn duplicate_scan_groups_only_matching_files_and_returns_to_live_search(
     cx: &mut TestAppContext,
 ) {
@@ -983,11 +1019,28 @@ async fn content_mode_is_opt_in_and_restores_filename_controls(cx: &mut TestAppC
     let handle = fixture.open(cx);
     wait_count(cx, handle, 6).await;
     cx.update_window(handle, |_, window, cx| {
+        let options = window.find("search-options");
+        assert_eq!(options.label(), Some("Search options"));
+        let bounds = options.bounds();
+        for (id, label) in [
+            ("content", "Search file contents"),
+            ("case", "Case sensitive"),
+            ("path", "Search full paths"),
+            ("regex", "Use regular expressions"),
+        ] {
+            let control = window.find(id);
+            assert_eq!(control.label(), Some(label));
+            assert!(bounds.contains(&control.bounds().origin));
+            assert!(bounds.contains(&control.bounds().bottom_right()));
+        }
         assert_ne!(window.find("content").checked(), Some(true));
         window.click("path", cx);
         window.click("regex", cx);
         window.click("content", cx);
         assert_eq!(window.find("content").checked(), Some(true));
+        assert_ne!(window.find("case").disabled(), Some(true));
+        window.click("case", cx);
+        assert_eq!(window.find("case").checked(), Some(true));
         window.click("path", cx);
         window.click("regex", cx);
         assert_eq!(window.find("path").checked(), Some(true));

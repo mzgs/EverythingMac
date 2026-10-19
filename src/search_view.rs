@@ -19,6 +19,7 @@ use gpui_kit::{
         progress::Progress,
         scroll::Scrollbar,
         spinner::Spinner,
+        tooltip::Tooltip,
     },
     *,
 };
@@ -1437,11 +1438,14 @@ impl Render for SearchView {
                         .when(self.filter == filter, |this| this.bg(cx.theme().selection).text_color(cx.theme().link))
                         .on_click(cx.listener(move |this, _, window, cx| this.change_filter(filter, window, cx)))
                 })))
-                .child(div().flex().items_center().gap_1()
-                    .child(Button::new("content").ghost().small().label("Content").tooltip("Search inside files using Spotlight").selected(self.content).toggled(self.content).when(self.content, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.content = !this.content; this.search(window, cx, true); })))
-                    .child(Button::new("case").ghost().small().label("Aa").tooltip("Case sensitive").selected(self.case).toggled(self.case).when(self.case, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.case = !this.case; this.search(window, cx, true); })))
-                    .child(Button::new("path").ghost().small().label("Path").tooltip("Search full paths (filename search only)").disabled(self.content).selected(self.path).toggled(self.path).when(self.path, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.path = !this.path; this.search(window, cx, true); })))
-                    .child(Button::new("regex").ghost().small().label("Regex").tooltip("Use a regular expression (filename search only)").disabled(self.content).selected(self.regex).toggled(self.regex).when(self.regex, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.regex = !this.regex; this.search(window, cx, true); })))
+                .child(div().id("search-options").test_support().role(Role::Group).aria_label("Search options")
+                    .flex().flex_shrink_0().items_center().gap_1().p_1().rounded_lg().border_1().border_color(cx.theme().border).bg(cx.theme().background.opacity(0.55)).text_color(cx.theme().muted_foreground)
+                    .child(Button::new("content").ghost().small().rounded_md().icon(if self.content { IconName::Check } else { IconName::FileText }).accessibility_label("Search file contents").tooltip("Search inside files content").selected(self.content).toggled(self.content).when(self.content, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.content = !this.content; this.search(window, cx, true); })))
+                    .child(div().w(px(1.)).h_4().mx_1().bg(cx.theme().border))
+                    .child(Button::new("case").ghost().small().rounded_md().icon(IconName::CaseSensitive).accessibility_label("Case sensitive").tooltip("Match uppercase and lowercase exactly").selected(self.case).toggled(self.case).when(self.case, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.case = !this.case; this.search(window, cx, true); })))
+                    .child(div().flex().items_center().gap_1().when(self.content, |this| this.opacity(0.45))
+                        .child(Button::new("path").ghost().small().rounded_md().icon(IconName::FolderTree).accessibility_label("Search full paths").tooltip(if self.content { "Path is unavailable in Content mode" } else { "Match the full folder path as well as the filename" }).disabled(self.content).selected(self.path).toggled(self.path).when(self.path && !self.content, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.path = !this.path; this.search(window, cx, true); })))
+                        .child(Button::new("regex").ghost().small().rounded_md().icon(IconName::Regex).accessibility_label("Use regular expressions").tooltip(if self.content { "Regex is unavailable in Content mode" } else { "Treat the query as a regular expression" }).disabled(self.content).selected(self.regex).toggled(self.regex).when(self.regex && !self.content, |this| this.bg(cx.theme().selection).text_color(cx.theme().link)).on_click(cx.listener(|this, _, window, cx| { this.regex = !this.regex; this.search(window, cx, true); }))))
                     ))
             .children(self.scope.clone().map(|scope| div().id("search-scope").test_support().role(Role::Status).aria_label(format!("Searching within {}", scope.display())).mx_5().mb_3().flex().items_center().gap_2().text_sm()
                 .child(Icon::new(IconName::Folder).small())
@@ -1495,7 +1499,13 @@ impl Render for SearchView {
                                 .child(Icon::new(if entry.is_dir { IconName::Folder } else { IconName::File }).small().flex_shrink_0()
                                     .text_color(if entry.is_dir { cx.theme().link } else { cx.theme().muted_foreground }))
                                 .child(div().min_w_0().truncate().child(group.map_or_else(|| name.clone(), |group| format!("#{group}  {name}")))))
-                            .child(div().flex_1().min_w_0().pr_3().truncate().text_color(cx.theme().muted_foreground).child(parent))
+                            .child(div().id(("result-path", i)).test_support().flex_1().min_w_0().pr_3().truncate().text_color(cx.theme().muted_foreground).child(parent.clone())
+                                .tooltip(move |window, cx| {
+                                    let parent = parent.clone();
+                                    let width = (window.viewport_size().width - px(64.)).min(px(560.));
+                                    Tooltip::element(move |_, _| div().id("path-tooltip-content").test_support().aria_label(parent.clone()).w(width).whitespace_normal().child(parent.clone()))
+                                        .build(window, cx)
+                                }))
                             .child(div().w(px(90.)).flex_shrink_0().child(if entry.is_dir { "—".into() } else { format_size(entry.allocated_size) }))
                             .child(div().w(px(90.)).flex_shrink_0().truncate().child(kind))
                             .child(div().w(px(110.)).flex_shrink_0().child(format_modified(entry.modified)))
