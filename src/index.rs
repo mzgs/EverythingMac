@@ -839,8 +839,21 @@ fn publish(
         .flatten()
         .collect();
     let warning = (!warnings.is_empty()).then(|| warnings.join("\n"));
-    let entries = Arc::new(entries.values().cloned().collect());
+    let entries: Arc<Vec<_>> = Arc::new(entries.values().cloned().collect());
     let mut snapshot = snapshot.write().unwrap();
+    if snapshot.scanning == scanning
+        && snapshot.skipped == errors.len()
+        && snapshot.scan_warning == scan_warning
+        && snapshot.warning == warning
+        && snapshot.entries.len() == entries.len()
+        && snapshot
+            .entries
+            .iter()
+            .zip(entries.iter())
+            .all(|(old, new)| Arc::ptr_eq(old, new) || old == new)
+    {
+        return;
+    }
     let previous = std::mem::replace(&mut snapshot.entries, entries);
     snapshot.loaded |= !snapshot.entries.is_empty() || !scanning;
     snapshot.scanning = scanning;
@@ -927,6 +940,28 @@ mod tests {
         let loaded = snapshot.read().unwrap().clone();
         assert!(loaded.loaded && loaded.scanning);
         assert_eq!(loaded.entries.len(), 1);
+        let unchanged: Entries = cached
+            .iter()
+            .map(|(path, entry)| (path.clone(), Arc::new(entry.as_ref().clone())))
+            .collect();
+        publish(&snapshot, &unchanged, &errors, &None, &None, true);
+        assert_eq!(
+            snapshot.read().unwrap().revision,
+            loaded.revision,
+            "Unchanged filesystem events must not trigger another search and sort"
+        );
+        let mut resized = unchanged;
+        Arc::make_mut(resized.first_entry().unwrap().get_mut()).allocated_size = 4096;
+        publish(&snapshot, &resized, &errors, &None, &None, true);
+        assert_eq!(snapshot.read().unwrap().revision, loaded.revision + 1);
+        assert_eq!(snapshot.read().unwrap().entries[0].allocated_size, 4096);
+        publish(&snapshot, &resized, &errors, &None, &None, false);
+        assert_eq!(snapshot.read().unwrap().revision, loaded.revision + 2);
+        assert!(!snapshot.read().unwrap().scanning);
+        let warning = Some("Live updates unavailable".to_string());
+        publish(&snapshot, &resized, &errors, &warning, &None, false);
+        assert_eq!(snapshot.read().unwrap().revision, loaded.revision + 3);
+        assert_eq!(snapshot.read().unwrap().warning, warning);
         publish(&snapshot, &Entries::new(), &errors, &None, &None, false);
         let refreshed = snapshot.read().unwrap();
         assert!(refreshed.loaded && !refreshed.scanning);
