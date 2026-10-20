@@ -32,23 +32,38 @@ pub(crate) fn register_action(
     });
 }
 
-pub(crate) fn show_error(message: String, window: &mut Window, cx: &mut App) {
+pub(crate) fn show_help(message: String, window: &mut Window, cx: &mut App) {
     let selection = gpui_kit::base::TextSelectionHandle::new(message.clone(), cx);
     // Selection must repaint immediately instead of waiting for the search poll.
+    selection.refresh_window_on_change(window, cx).detach();
+    window.open_dialog(cx, move |dialog, _, _| {
+        dialog
+            .title("Everything Mac")
+            .child(message_description(message.clone(), selection.clone()))
+            .footer(
+                DialogFooter::new()
+                    .child(DialogAction::new().child(Button::new("ok").primary().label("OK"))),
+            )
+    });
+}
+
+pub(crate) fn show_error(message: String, window: &mut Window, cx: &mut App) {
+    let selection = gpui_kit::base::TextSelectionHandle::new(message.clone(), cx);
     selection.refresh_window_on_change(window, cx).detach();
     window.open_alert_dialog(cx, move |dialog, _, _| {
         dialog
             .title("Everything Mac")
-            .child(
-                DialogDescription::new().child(div().id("dialog-message").test_support().child(
-                    gpui_kit::base::SelectableText::with_handle(
-                        "dialog-text",
-                        selection.clone(),
-                        message.clone(),
-                    ),
-                )),
-            )
+            .child(message_description(message.clone(), selection.clone()))
     });
+}
+
+fn message_description(
+    message: String,
+    selection: gpui_kit::base::TextSelectionHandle,
+) -> DialogDescription {
+    DialogDescription::new().child(div().id("dialog-message").test_support().child(
+        gpui_kit::base::SelectableText::with_handle("dialog-text", selection, message),
+    ))
 }
 
 fn open(

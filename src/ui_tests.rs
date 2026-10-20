@@ -902,6 +902,23 @@ async fn rename_menu_can_cancel_reject_collisions_and_update_results(cx: &mut Te
 }
 
 #[gpui_kit::test]
+async fn help_closes_on_outside_click(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let handle = fixture.open(cx);
+    wait_count(cx, handle, 6).await;
+    cx.update_window(handle, |_, window, cx| window.click("help", cx))
+        .unwrap();
+    wait_dialog(cx, handle, true).await;
+    cx.update_window(handle, |_, window, cx| {
+        window.click("dialog-message", cx);
+        assert!(window.try_find("dialog").is_some());
+        window.click_at("dialog", gpui_kit::point(px(8.), px(400.)), cx);
+    })
+    .unwrap();
+    wait_dialog(cx, handle, false).await;
+}
+
+#[gpui_kit::test]
 async fn help_text_can_be_selected_and_copied_but_not_edited(cx: &mut TestAppContext) {
     let fixture = Fixture::new();
     let handle = fixture.open(cx);
