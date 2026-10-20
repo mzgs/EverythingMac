@@ -620,7 +620,7 @@ impl SearchView {
                 report.retain_current(&self.snapshot.entries);
                 let results = report.results.clone();
                 self.set_results(results, cx, false);
-            } else if self.search_task.is_none() {
+            } else if self.search_task.is_none() && (!self.snapshot.scanning || self.starting) {
                 self.search(window, cx, false);
             }
         }
@@ -743,10 +743,7 @@ impl SearchView {
                     }
                     this.searching = false;
                     this.sorting = true;
-                    if loaded {
-                        this.starting = false;
-                    }
-                    this.set_results(results.clone(), cx, reveal_selection);
+                    cx.notify();
                     true
                 });
                 if !matches!(published, Ok(true)) {
@@ -831,7 +828,7 @@ impl SearchView {
                         sort,
                         descending,
                     });
-                } else {
+                } else if !this.snapshot.scanning {
                     this.search(window, cx, false);
                 }
             });
@@ -2207,6 +2204,7 @@ mod tests {
             .update(cx, |view, window, cx| {
                 view._poll = gpui_kit::Task::ready(());
                 view.search_task = None;
+                view.snapshot.scanning = false;
                 view.snapshot.entries = Arc::new(
                     (0..2000)
                         .map(|i| {
@@ -2268,6 +2266,137 @@ mod tests {
                 assert!(view.results.is_empty());
             })
             .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn scanning_keeps_sorted_results_until_completion(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            cx.set_global(Settings {
+                roots: Vec::new(),
+                excluded: Vec::new(),
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::size(gpui_kit::px(1050.), gpui_kit::px(450.)),
+            |window, cx| SearchView::new(None, window, cx),
+        );
+        let entries: Vec<_> = [2, 3, 1, 4, 5]
+            .into_iter()
+            .enumerate()
+            .map(|(i, size)| {
+                Arc::new(Entry {
+                    path: PathBuf::from(format!("/fixture/file-{i}.txt")),
+                    is_dir: false,
+                    size,
+                    allocated_size: size * 4096,
+                    modified: None,
+                })
+            })
+            .collect();
+        let task = window
+            .update(cx, |view, window, cx| {
+                view._poll = gpui_kit::Task::ready(());
+                view.search_task = None;
+                view.snapshot.loaded = true;
+                view.snapshot.scanning = false;
+                view.snapshot.entries = Arc::new(entries[..3].to_vec());
+                view.sort = crate::saved_searches::Sort::Size;
+                view.descending = true;
+                view.search(window, cx, false);
+                view.search_task.take().unwrap()
+            })
+            .unwrap();
+        task.await;
+        let task = window
+            .update(cx, |view, window, cx| {
+                assert_eq!(
+                    view.results
+                        .iter()
+                        .map(|entry| entry.size)
+                        .collect::<Vec<_>>(),
+                    [3, 2, 1]
+                );
+                let displayed = view.results.clone();
+                let generation = view.generation.load(std::sync::atomic::Ordering::Relaxed);
+                for _ in 0..10 {
+                    let mut snapshot = view.snapshot.clone();
+                    snapshot.scanning = true;
+                    snapshot.revision += 1;
+                    snapshot.entries = Arc::new(entries[..4].to_vec());
+                    view.update_snapshot(snapshot, window, cx);
+                    assert!(view.search_task.is_none());
+                    assert!(Arc::ptr_eq(&view.results, &displayed));
+                    assert_eq!(
+                        view.generation.load(std::sync::atomic::Ordering::Relaxed),
+                        generation
+                    );
+                }
+                // Explicit sorting still works while scanning, even with newer snapshots queued.
+                view.descending = false;
+                view.search(window, cx, false);
+                let mut snapshot = view.snapshot.clone();
+                snapshot.revision += 1;
+                snapshot.entries = Arc::new(entries);
+                view.update_snapshot(snapshot, window, cx);
+                view.search_task.take().unwrap()
+            })
+            .unwrap();
+        task.await;
+        let view = window
+            .update(cx, |view, _, cx| {
+                assert!(
+                    view.search_task.is_none(),
+                    "Wait for scan completion to refresh"
+                );
+                assert_eq!(
+                    view.results
+                        .iter()
+                        .map(|entry| entry.size)
+                        .collect::<Vec<_>>(),
+                    [1, 2, 3, 4]
+                );
+                cx.entity()
+            })
+            .unwrap();
+        let displayed = cx.update(|cx| view.read(cx).results.clone());
+        let sorting_updates = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = sorting_updates.clone();
+        let _subscription = cx.update(|cx| {
+            cx.observe(&view, move |view, cx| {
+                let view = view.read(cx);
+                if view.sorting {
+                    observed.set(observed.get() + 1);
+                    assert!(
+                        Arc::ptr_eq(&view.results, &displayed),
+                        "Keep unsorted results hidden"
+                    );
+                }
+            })
+        });
+        let task = window
+            .update(cx, |view, window, cx| {
+                let mut snapshot = view.snapshot.clone();
+                snapshot.scanning = false;
+                snapshot.revision += 1;
+                view.update_snapshot(snapshot, window, cx);
+                view.search_task.take().unwrap()
+            })
+            .unwrap();
+        task.await;
+        assert!(sorting_updates.get() > 0);
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(!view.searching && !view.sorting);
+            assert!(view.search_task.is_none());
+            assert_eq!(
+                view.results
+                    .iter()
+                    .map(|entry| entry.size)
+                    .collect::<Vec<_>>(),
+                [1, 2, 3, 4, 5]
+            );
+        });
     }
 
     #[gpui_kit::test]
@@ -2679,6 +2808,7 @@ mod tests {
         let task = window
             .update(cx, |view, window, cx| {
                 let mut snapshot = view.snapshot.clone();
+                snapshot.scanning = false;
                 snapshot.revision += 1;
                 snapshot.entries = Arc::new(
                     snapshot
